@@ -1,63 +1,74 @@
 """
 config.py — All tunable parameters in one place.
-Change weights/thresholds here; everything else adapts automatically.
 
-CHANGELOG v2.0 (June 2026):
-  - Safe System thresholds revised: tertiary urban raised to 40 km/h (from 30)
-    to reflect current WHO/iRAP Asia-Pacific baseline vs aspirational Vision Zero.
-  - SPEED_GAP_ZERO raised to 0.05 (5%) to account for normal GPS measurement noise
-    and natural 85th-percentile measurement offset.
-  - SPEED_GAP_CRITICAL raised to 0.30 (30%) for better discrimination.
-  - Score band thresholds recalibrated: Critical/High Risk were over-represented
-    (~34%/30% of segments vs target ~10%/20%).
-  - WHO_FATALITY_RATE moved to config (was hardcoded in advanced_scoring.py).
-  - Helmet SPI values added: integrated into VRU risk scoring.
+CHANGELOG v2.1 (June 2026 — calibrated against real data):
+  Issue: bands calibrated on synthetic data (mean SSS ~55) failed on real
+  data (mean SSS ~32, max ~75). Four root causes found and fixed:
+
+  1. SAFE_SYSTEM_THRESHOLDS: rural road limits were too permissive.
+     WHO/iRAP standard for UNDIVIDED rural roads (typical in Asia) is
+     lower than for divided highways. Primary/secondary rural revised
+     downward to reflect absence of median separation in MH/TH context.
+
+  2. SCORE_BANDS: recalibrated to real data distribution (mean=32, max=75).
+     Old bands (Critical>=78) meant 0% Critical on real data.
+
+  3. SPEED_GAP_ZERO: reduced from 5% back to 2%. The 5% floor was too
+     generous — it zeroed out meaningful overages on low-speed rural roads.
+
+  4. SPEED_GAP_CRITICAL: reduced from 30% back to 20%. 30% critical threshold
+     was too high; at 6% over limit on a rural 80km/h road, sub-score was ~5.
+
+  5. VRU rural risk scores raised: rural roads in Asia are NOT low-risk for
+     VRUs — undivided highways carry pedestrians, cyclists and PTW riders
+     with no separation. rc_score_map now reflects this.
 """
 
 # ─── Safe System Speed Thresholds (km/h) ────────────────────────────────────
-# Sources: WHO Safe System Approach; iRAP Star Rating methodology;
-#          OECD Speed Management (2018); ADB Road Safety Manual (2023)
+# Sources: WHO Safe System Approach; iRAP Star Rating 2023;
+#          ADB Road Safety Manual; WHO Global Status Report 2023
 #
-# REVISION NOTE (v2.0):
-#   - tertiary/local URBAN revised from 30 → 40 km/h.
-#     Rationale: WHO recommends 30 km/h for streets where pedestrians and
-#     cyclists mix with motorized traffic. However, iRAP and ADB use 40–50 km/h
-#     as the current Safe System threshold for undivided urban roads in LMICs.
-#     30 km/h is the aspirational Vision Zero target; scoring against it in
-#     2026 would make virtually every Asian urban tertiary road appear "Critical,"
-#     which reduces policy utility. We use 40 km/h as the implementable threshold
-#     and flag 30 km/h as the aspirational target separately.
-#   - secondary URBAN raised from 50 → 50 km/h (unchanged — this is WHO standard)
-#   - primary URBAN: 50 km/h unchanged (major speed-limit reform target in Asia)
+# KEY REVISION (v2.1 — real data calibration):
+#   Rural primary/secondary revised from 80 → 70 km/h.
+#   Rationale: Most roads in Maharashtra and Thailand outside urban areas
+#   are UNDIVIDED (no median, 2-lane bidirectional). WHO Safe System and
+#   iRAP stipulate a maximum of 70 km/h for undivided rural carriageways
+#   due to head-on conflict risk and PTW/pedestrian exposure.
+#   80 km/h is reserved for DIVIDED (median-separated) rural roads.
+#   Since the dataset has no median field, we conservatively apply 70 km/h
+#   to primary/secondary rural as the predominant road type.
+#   Trunk rural revised 100→90; motorway rural revised 110→100.
 SAFE_SYSTEM_THRESHOLDS = {
     # Urban roads (km/h)
-    ("local",       "urban"):  40,   # revised: 30→40 (see note above)
-    ("residential", "urban"):  30,   # residential streets: keep 30 (fewer thru-vehicles)
-    ("tertiary",    "urban"):  40,   # revised: 30→40
-    ("secondary",   "urban"):  50,   # WHO standard for undivided urban
-    ("primary",     "urban"):  50,   # key intervention target in Asia
-    ("trunk",       "urban"):  60,   # divided carriageway
-    ("motorway",    "urban"):  80,   # controlled access
-    # Rural roads (km/h)
+    ("local",       "urban"):  40,
+    ("residential", "urban"):  30,
+    ("tertiary",    "urban"):  40,
+    ("secondary",   "urban"):  50,
+    ("primary",     "urban"):  50,
+    ("trunk",       "urban"):  60,
+    ("motorway",    "urban"):  80,
+    # Rural roads — undivided assumption (km/h)
     ("local",       "rural"):  60,
     ("residential", "rural"):  60,
     ("tertiary",    "rural"):  60,
-    ("secondary",   "rural"):  80,   # WHO standard; undivided rural
-    ("primary",     "rural"):  80,
-    ("trunk",       "rural"): 100,
-    ("motorway",    "rural"): 110,
-    # Defaults (when road class or land use cannot be determined)
+    ("secondary",   "rural"):  70,   # revised: 80→70 (undivided rural)
+    ("primary",     "rural"):  70,   # revised: 80→70 (undivided rural)
+    ("trunk",       "rural"):  90,   # revised: 100→90
+    ("motorway",    "rural"): 100,   # revised: 110→100
+    # Defaults
     ("unknown",     "urban"):  50,
-    ("unknown",     "rural"):  80,
+    ("unknown",     "rural"):  70,   # revised: 80→70
     ("unknown",     "unknown"):60,
 }
 
-# Aspirational Vision Zero thresholds (for informational flagging only)
+# Aspirational Vision Zero targets (informational, not used in scoring)
 ASPIRATIONAL_SS_THRESHOLDS = {
     ("local",       "urban"):  30,
     ("tertiary",    "urban"):  30,
     ("secondary",   "urban"):  40,
     ("primary",     "urban"):  50,
+    ("secondary",   "rural"):  60,
+    ("primary",     "rural"):  60,
 }
 
 # ─── Road class normalizer ───────────────────────────────────────────────────
@@ -87,47 +98,39 @@ ROAD_CLASS_MAP = {
 
 # ─── Land use normalizer ─────────────────────────────────────────────────────
 LAND_USE_MAP = {
-    "urban":    "urban",
+    "urban":     "urban",
     "peri-urban":"urban",
-    "suburban": "urban",
-    "rural":    "rural",
-    "intercity":"rural",
+    "suburban":  "urban",
+    "rural":     "rural",
+    "intercity": "rural",
 }
 
 # ─── Scoring weights ─────────────────────────────────────────────────────────
-# Rationale for each weight:
-#   speed_limit_alignment (0.30): Core challenge ask — is the posted limit
-#     Safe-System-appropriate? Highest weight because this IS the policy lever.
-#   operating_speed_gap (0.25): Reflects actual driver behaviour vs limit.
-#     Reduced slightly (was 0.25, unchanged) — empirically shown to dominate
-#     due to high mean sub-score (60.7). Helmet SPI now handles VRU severity.
-#   vru_context_risk (0.25): Now enhanced with helmet SPI modifier.
-#     Unchanged in weight but richer in content.
-#   compliance_rate (0.20): INCREASED from 0.15. The ADB challenge explicitly
-#     asks about limits that are "misaligned with real-world road conditions."
-#     High % over limit is the strongest empirical signal of misalignment.
 WEIGHTS = {
     "speed_limit_alignment": 0.30,
-    "operating_speed_gap":   0.23,   # slightly reduced (was 0.25)
-    "vru_context_risk":      0.27,   # slightly increased (was 0.25); helmet SPI added
-    "compliance_rate":       0.20,   # increased from 0.15
-    "confidence_weight":     0.05,   # multiplier, not additive
+    "operating_speed_gap":   0.23,
+    "vru_context_risk":      0.27,
+    "compliance_rate":       0.20,
+    "confidence_weight":     0.05,
 }
 
 # ─── Score band thresholds ────────────────────────────────────────────────────
-# RECALIBRATED v2.0:
-#   Target distribution: ~10% Critical, ~20% High Risk, ~30% Moderate, ~40% Acceptable
-#   Previous bands (65/48/30/0) produced ~34% Critical, ~30% High Risk — too many flags,
-#   reducing the policy signal. With observed mean SSS ~55 and std ~22:
-#   - Critical: top ~10% → approximately SSS ≥ 78
-#   - High Risk: next ~20% → approximately SSS 62–78
-#   - Moderate:  next ~30% → approximately SSS 40–62
-#   - Acceptable: bottom ~40% → SSS < 40
+# RECALIBRATED v2.1 against real data (mean=32.1, std=16.5, max=74.8):
+#   Target: ~10% Critical, ~20% High Risk, ~30% Moderate, ~40% Acceptable
+#   Percentile analysis on real distribution:
+#     90th pct ≈ 53  → Critical >= 52
+#     70th pct ≈ 41  → High Risk >= 40
+#     40th pct ≈ 28  → Moderate >= 27
+#
+#   Policy rationale for Critical>=52:
+#     TH urban primary/secondary mean SSS ~50-51 → correctly flagged Critical
+#     MH rural primary mean SSS ~19 → correctly Acceptable (posted=80, SS=70)
+#     TH trunk urban mean SSS ~49 → High Risk/Critical boundary
 SCORE_BANDS = {
-    "Critical":   (78, 100),
-    "High Risk":  (62,  78),
-    "Moderate":   (40,  62),
-    "Acceptable": ( 0,  40),
+    "Critical":   (52, 100),
+    "High Risk":  (40,  52),
+    "Moderate":   (27,  40),
+    "Acceptable": ( 0,  27),
 }
 
 BAND_COLORS = {
@@ -142,48 +145,56 @@ MIN_SAMPLE_SIZE = 5
 LOW_SAMPLE_PENALTY = 0.75
 
 # ─── Operating speed gap thresholds ─────────────────────────────────────────
-# REVISED v2.0:
-#   SPEED_GAP_ZERO raised from 0.00 → 0.05 (5%)
-#     Rationale: GPS probe data has inherent measurement noise of ~3-5%.
-#     The Data Guide (ADB 2026) shows F85th naturally runs ~5-10% above
-#     posted limits even on compliant roads (sample: 97 km/h on 90 km/h limit).
-#     Treating 0% as the threshold creates false positives.
-#   SPEED_GAP_CRITICAL raised from 0.20 → 0.30 (30%)
-#     Rationale: The previous 20% threshold caused ~60% of scored segments
-#     to hit the ceiling (score=100 on this dimension), collapsing discrimination.
-#     30% better reflects "limit credibility has truly collapsed" — consistent
-#     with the credibility module's non-credible threshold of 20 km/h absolute.
-SPEED_GAP_ZERO     = 0.05   # ≤5% over limit → zero score on this dimension
-SPEED_GAP_CRITICAL = 0.30   # ≥30% over limit → maximum score
+# REVISED v2.1:
+#   SPEED_GAP_ZERO: 5% → 2%
+#     The 5% floor was too aggressive for real data. On a rural 80km/h road,
+#     F85th=85 is 6.25% over — a meaningful overspeed. At 5% floor, this
+#     scored only ~5. At 2%, it scores 22 — more accurately reflecting risk.
+#   SPEED_GAP_CRITICAL: 30% → 20%
+#     30% was too high for Asia-Pacific context where limits are often
+#     already elevated. 20% better captures "limit has lost credibility."
+SPEED_GAP_ZERO     = 0.02   # ≤2% over limit → zero score
+SPEED_GAP_CRITICAL = 0.20   # ≥20% over limit → maximum score
 
 # ─── WHO Regional Fatality Rates (per billion vehicle-km) ────────────────────
-# Source: WHO Global Status Report on Road Safety 2023
-# Moved here from advanced_scoring.py for transparency and easy tuning.
 WHO_FATALITY_RATE = {
-    "MH": 8.5,    # Maharashtra (India): higher due to mixed traffic + PTW share
-    "TH": 6.2,    # Thailand
+    "MH": 8.5,
+    "TH": 6.2,
     "default": 7.0,
 }
-VKM_PER_WEIGHTED_SAMPLE = 1.0  # calibration factor — see methodology doc
+VKM_PER_WEIGHTED_SAMPLE = 1.0
 
 # ─── Helmet SPI (Safety Performance Indicator) ───────────────────────────────
 # Source: ADB Road Safety SPI dataset (provided with challenge)
-# SPI = proportion of riders wearing helmets (0=none, 1=all)
-# Used as a severity modifier in VRU risk scoring:
-#   helmet_risk_multiplier = 1 + (1 - SPI) * HELMET_SEVERITY_WEIGHT
-# A low SPI means crashes at ANY speed are more lethal → amplifies VRU risk.
 HELMET_SPI = {
-    # (country_code, land_use) → SPI value
-    ("MH", "urban"):   0.237,   # Maharashtra urban, all riders
-    ("MH", "rural"):   0.148,   # Maharashtra rural, all riders (worse)
-    ("MH", "unknown"): 0.209,   # Maharashtra combined
-    ("TH", "urban"):   0.789,   # Thailand urban
-    ("TH", "rural"):   0.672,   # Thailand rural
-    ("TH", "unknown"): 0.778,   # Thailand combined
+    ("MH", "urban"):   0.237,
+    ("MH", "rural"):   0.148,
+    ("MH", "unknown"): 0.209,
+    ("TH", "urban"):   0.789,
+    ("TH", "rural"):   0.672,
+    ("TH", "unknown"): 0.778,
 }
-# Weight of helmet non-compliance in VRU risk amplification (0.0–1.0)
-# 0.40 means a road where nobody wears a helmet gets up to 40% higher VRU risk score
 HELMET_SEVERITY_WEIGHT = 0.40
+
+# ─── VRU rural road risk adjustment ─────────────────────────────────────────
+# Rural road VRU base scores revised upward (v2.1).
+# Rationale: Undivided rural highways in MH/TH carry significant PTW,
+# pedestrian and cyclist traffic with no separation infrastructure.
+# iRAP data shows pedestrian/PTW fatalities are NOT confined to urban areas —
+# rural highways account for 60%+ of road deaths in both countries.
+# rc_score_map used inside scoring.py:
+#   primary rural: 35 (was 25) — undivided national highway, mixed traffic
+#   trunk rural:   30 (was 15) — intercity trucks + PTW
+VRU_RC_SCORE_MAP = {
+    "local":       80,
+    "residential": 80,
+    "tertiary":    65,
+    "secondary":   50,   # raised from 45
+    "primary":     35,   # raised from 25
+    "trunk":       30,   # raised from 15
+    "motorway":    10,
+    "unknown":     50,
+}
 
 # ─── Sensitivity analysis ────────────────────────────────────────────────────
 SENSITIVITY_DELTA = 0.10
