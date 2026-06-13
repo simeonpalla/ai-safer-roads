@@ -1,9 +1,0 @@
-perturbed_weight,direction,new_value,spearman_rho_vs_base,pct_top20_changed
-speed_limit_alignment,+,0.364,0.9808,18.7
-speed_limit_alignment,-,0.222,0.9735,40.1
-operating_speed_gap,+,0.3,0.971,53.0
-operating_speed_gap,-,0.144,0.9549,25.1
-vru_context_risk,+,0.336,0.9952,15.2
-vru_context_risk,-,0.189,0.9965,9.5
-compliance_rate,+,0.273,0.9997,1.9
-compliance_rate,-,0.111,0.9994,4.0
