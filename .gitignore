@@ -3,3 +3,5 @@ outputs/
 codeTester.ipynb
 __pycache__/
 *.pyc
+.env/
+env/
