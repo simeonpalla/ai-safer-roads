@@ -11,8 +11,9 @@ import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from scipy import stats
 
-from config import WEIGHTS, SENSITIVITY_DELTA, SCORE_BANDS, BAND_COLORS
-from scoring import compute_speed_safety_score, add_safe_system_limits
+from config import SENSITIVITY_DELTA, SCORE_BANDS, BAND_COLORS
+from scoring import compute_speed_safety_score, add_safe_system_limits, WEIGHTS
+import priority_scoring
 
 
 def validate_against_adb_baseline(gdf: gpd.GeoDataFrame) -> dict:
@@ -185,6 +186,56 @@ def score_diagnostics(gdf: gpd.GeoDataFrame) -> None:
         print(f"  % {band:<12} {pct:5.1f}%")
 
 
+def export_manual_review_sample(
+    gdf: gpd.GeoDataFrame,
+    output_dir: str = ".",
+    n: int = 20,
+    score_col: str = "sss",
+) -> pd.DataFrame:
+    """
+    Export the n highest- and n lowest-scored segments for manual review.
+
+    WHY THIS EXISTS: validate_against_adb_baseline() compares this score to
+    ADB's own RankedPercentile column — that's a comparison between two
+    scores, not validation against an outcome (crashes/injuries/fatalities).
+    No such outcome data exists in this dataset, so it can't be built from
+    code alone. This export is the cheap, honest substitute: pull the
+    highest- and lowest-scored segments alongside their street imagery link
+    so a road engineer can sanity-check "would I agree this is
+    Critical/Acceptable looking at the actual road" — not rigorous
+    validation, but a real, defensible check that's currently missing
+    entirely.
+    """
+    mask = gdf["scoreable"] & gdf[score_col].notna()
+    df = gdf.loc[mask].copy()
+    if len(df) == 0:
+        print(f"\n[Manual Review Export] No scored segments available — skipping")
+        return pd.DataFrame()
+
+    cols = [c for c in [
+        "segment_id", "country_code", "road_class_norm", "land_use",
+        score_col, f"{score_col}_band", "speed_limit", "ss_limit", "speed_85th",
+        "sub_score_limit_alignment", "sub_score_limit_credibility", "sub_score_vru_risk",
+        "sss_recommendation", "image_url",
+    ] if c in df.columns]
+
+    top    = df.nlargest(n, score_col)[cols].copy()
+    top["review_group"] = f"TOP {n} (highest {score_col.upper()})"
+    bottom = df.nsmallest(n, score_col)[cols].copy()
+    bottom["review_group"] = f"BOTTOM {n} (lowest {score_col.upper()})"
+
+    review = pd.concat([top, bottom], ignore_index=True)
+    out_path = f"{output_dir}/manual_review_sample.csv"
+    review.to_csv(out_path, index=False)
+
+    n_with_image = review["image_url"].notna().sum() if "image_url" in review.columns else 0
+    print(f"\n[Manual Review Export] {len(review)} segments "
+          f"({n} highest + {n} lowest {score_col.upper()}) → {out_path}")
+    print(f"  {n_with_image}/{len(review)} have a street imagery link — "
+          f"open each and ask: would a road engineer agree with this score?")
+    return review
+
+
 def run_full_evaluation(gdf: gpd.GeoDataFrame, output_dir: str = ".") -> dict:
     print("\n" + "="*60)
     print("  SPEED SAFETY SCORE — EVALUATION REPORT")
@@ -196,21 +247,39 @@ def run_full_evaluation(gdf: gpd.GeoDataFrame, output_dir: str = ".") -> dict:
     overlap  = top_segment_overlap(gdf, top_pct=0.20)
     sens_df  = sensitivity_analysis(gdf)
     cc_df    = cross_country_consistency(gdf)
+    review_df = export_manual_review_sample(gdf, output_dir=output_dir, n=20, score_col="sss")
 
     if not sens_df.empty:
         sens_df.to_csv(f"{output_dir}/sensitivity_analysis.csv", index=False)
     cc_df.to_csv(f"{output_dir}/cross_country_consistency.csv")
 
-    print("\n" + "="*60)
-    print("  Evaluation complete. Files saved to:", output_dir)
-    print("="*60)
-
-    return {
+    results = {
         "baseline_validation": baseline,
         "top20_overlap":       overlap,
         "sensitivity":         sens_df,
         "cross_country":       cc_df,
+        "manual_review_sample": review_df,
     }
+
+    # Priority Index evaluation — runs only if priority_scoring.py has already
+    # added the column (see main.py). Kept separate from the SSS evaluation
+    # above so SSS results are unaffected either way.
+    if "priority_index" in gdf.columns:
+        print("\n" + "="*60)
+        print("  PRIORITY INDEX — EVALUATION")
+        print("="*60)
+        sss_vs_priority = priority_scoring.compare_to_sss(gdf)
+        priority_sens_df = priority_scoring.priority_sensitivity_analysis(gdf)
+        if not priority_sens_df.empty:
+            priority_sens_df.to_csv(f"{output_dir}/priority_index_sensitivity_analysis.csv", index=False)
+        results["sss_vs_priority_index"]       = sss_vs_priority
+        results["priority_index_sensitivity"]  = priority_sens_df
+
+    print("\n" + "="*60)
+    print("  Evaluation complete. Files saved to:", output_dir)
+    print("="*60)
+
+    return results
 
 
 def plot_score_overview(gdf: gpd.GeoDataFrame, output_path: str = "score_overview.png"):
@@ -221,9 +290,9 @@ def plot_score_overview(gdf: gpd.GeoDataFrame, output_path: str = "score_overvie
         print("No scored data to plot.")
         return
 
-    fig = plt.figure(figsize=(18, 12))
+    fig = plt.figure(figsize=(22, 12))
     fig.suptitle("Speed Safety Score — Diagnostic Overview", fontsize=16, fontweight="bold")
-    gs  = gridspec.GridSpec(2, 3, figure=fig, hspace=0.4, wspace=0.35)
+    gs  = gridspec.GridSpec(2, 4, figure=fig, hspace=0.4, wspace=0.35)
 
     # 1. Distribution
     ax1 = fig.add_subplot(gs[0, 0])
@@ -254,6 +323,20 @@ def plot_score_overview(gdf: gpd.GeoDataFrame, output_path: str = "score_overvie
         ax3.barh(corr.index, corr.values, color="#2ecc71", edgecolor="white")
         ax3.set_xlabel("Pearson r with SSS")
     ax3.set_title("Sub-Score Contribution")
+
+    # 7. SSS vs Priority Index — only if priority_scoring.py has run.
+    # This is the panel most directly useful for "decide after seeing it":
+    # tight diagonal clustering = the two methods agree; scatter/fan-out =
+    # Priority Index is surfacing a meaningfully different set of roads.
+    if "priority_index" in df.columns:
+        ax7 = fig.add_subplot(gs[0, 3])
+        sub_pi = df[df["priority_index"].notna()]
+        for cc, color in zip(["MH", "TH"], ["#e74c3c", "#3498db"]):
+            s = sub_pi[sub_pi["country_code"] == cc]
+            if len(s):
+                ax7.scatter(s["sss"], s["priority_index"], alpha=0.3, s=5, c=color, label=cc)
+        ax7.set_xlabel("SSS (legacy)"); ax7.set_ylabel("Priority Index (new)")
+        ax7.set_title("SSS vs Priority Index"); ax7.legend(markerscale=3)
 
     # 4. SSS vs ADB Baseline scatter
     ax4 = fig.add_subplot(gs[1, 0])

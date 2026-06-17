@@ -250,28 +250,74 @@ def merge_datasets(mh: gpd.GeoDataFrame, th: gpd.GeoDataFrame) -> gpd.GeoDataFra
 
 def get_analysis_subset(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
-    Mark segments as scoreable.
-    Requires: has speed data AND speed_limit AND speed_85th.
-    median_speed is optional (used in scoring but not required).
+    Mark segments as scoreable, at two tiers.
+
+    TIER 2 — "scoreable" (full score): requires posted limit AND 85th-pct
+    speed AND general speed-data presence, all NONZERO. This is the
+    behaviourally-confirmed SSS most of this pipeline reports.
+
+    TIER 1 — "alignment_scoreable" (NEW, v3.1): requires ONLY a usable
+    posted limit (no behavioural/GPS data needed at all). This produces
+    sub_score_limit_alignment alone — "does the posted limit match the
+    Safe System standard for this road class/land use" — which doesn't
+    need F85 or median speed. It exists because the brief explicitly asks
+    for a methodology that's "scalable and replicable across countries,"
+    and many ADB member countries won't have rich GPS-probe behavioural
+    data the way this MH/TH demo dataset does. A method that hard-depends
+    on behavioural data isn't very replicable.
+
+    HONEST CAVEAT for THIS dataset specifically: Tier 1 will NOT
+    dramatically raise coverage here, because in both MH and TH most of
+    the ~79% unscored segments are missing speed_limit too, not just
+    behavioural fields (ADB's AnalysisStatus/ForAnalysis flags appear to
+    gate most fields together, not selectively). Tier 1 still adds real
+    value: it's the right architecture for other countries' data, and it
+    picks up whatever segments in THIS dataset have a limit but lack full
+    behavioural confirmation.
+
+    BUG FIX (reviewer feedback, June 2026): some source rows use a literal
+    0 as a placeholder for "no data" instead of NaN — e.g. speed_limit=0,
+    median_speed=0, AND speed_85th=0 all at once on the same row. A posted
+    speed limit of 0 km/h doesn't exist on a real road, and an 85th-
+    percentile speed of exactly 0 km/h for an entire sampled segment would
+    only happen if a road were permanently gridlocked — for an entire
+    segment's sample, this is for all practical purposes never genuine.
+    The previous .notna()-only check let these placeholder rows through as
+    "scoreable", and they then surfaced in the map/CSV/AI layer labelled
+    "Acceptable" with a real-looking SSS/Priority Index, which is wrong:
+    they should be excluded, not scored as calm roads.
+    median_speed is NOT included in this zero-check by itself — a real,
+    very low (but nonzero) median can legitimately occur on a congested
+    segment, so median_speed==0 alone does not invalidate a row.
     """
     gdf = gdf.copy()
 
     has_speed_data = gdf["has_speed_data"].fillna(False)
-    has_limit      = gdf["speed_limit"].notna()
-    has_85th       = gdf["speed_85th"].notna()
+    has_limit      = gdf["speed_limit"].notna() & (gdf["speed_limit"] > 0)
+    has_85th       = gdf["speed_85th"].notna()  & (gdf["speed_85th"]  > 0)
     # median_speed is desirable but not a hard requirement
     has_median     = gdf["median_speed"].notna() if "median_speed" in gdf.columns \
                      else pd.Series(True, index=gdf.index)
 
-    gdf["scoreable"] = has_speed_data & has_limit & has_85th
+    gdf["scoreable"]            = has_speed_data & has_limit & has_85th
+    gdf["alignment_scoreable"]  = has_limit   # Tier 1 — posted limit alone
 
     # Diagnostic breakdown
+    n_zero_limit = int((gdf["speed_limit"] == 0).sum()) if "speed_limit" in gdf.columns else 0
+    n_zero_85th  = int((gdf["speed_85th"]  == 0).sum()) if "speed_85th"  in gdf.columns else 0
     print(f"\nScoreable condition breakdown:")
     print(f"  has_speed_data:   {has_speed_data.sum():,}")
-    print(f"  has_limit:        {has_limit.sum():,}")
-    print(f"  has_85th:         {has_85th.sum():,}")
+    print(f"  has_limit (>0):   {has_limit.sum():,}  "
+          f"({n_zero_limit:,} excluded as speed_limit==0 placeholder)")
+    print(f"  has_85th (>0):    {has_85th.sum():,}  "
+          f"({n_zero_85th:,} excluded as speed_85th==0 placeholder)")
     print(f"  has_median:       {has_median.sum():,}")
-    print(f"  ALL (scoreable):  {gdf['scoreable'].sum():,} / {len(gdf):,} "
+    print(f"  TIER 2 (scoreable, full SSS):        {gdf['scoreable'].sum():,} / {len(gdf):,} "
           f"({100*gdf['scoreable'].mean():.1f}%)")
+    print(f"  TIER 1 (alignment_scoreable, limit only): {gdf['alignment_scoreable'].sum():,} / {len(gdf):,} "
+          f"({100*gdf['alignment_scoreable'].mean():.1f}%)")
+    n_tier1_only = (gdf["alignment_scoreable"] & ~gdf["scoreable"]).sum()
+    print(f"  Tier 1 adds {n_tier1_only:,} segments beyond Tier 2 "
+          f"(have a posted limit but lack full behavioural confirmation)")
 
     return gdf

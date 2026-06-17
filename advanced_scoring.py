@@ -233,10 +233,12 @@ def lives_saved(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     print(f"\n  ── Lives Saved Estimates (study area, annual) ──")
     print(f"  Est. current annual fatalities (proxy): {current.sum():.1f}")
     print(f"  Est. lives saved if limits corrected:   {central.sum():.1f}")
-    print(f"  Uncertainty range:                      "
-          f"{central.sum()*0.5:.1f} – {central.sum()*2.0:.1f}")
-    print(f"  NOTE: These are order-of-magnitude estimates.")
-    print(f"        Assumptions documented in methodology.")
+    print(f"  Uncertainty range:                      {central.sum()*0.5:.1f} – {central.sum()*2.0:.1f}")
+    print(f"  ⚠ NOT VALIDATED — VKM_PER_WEIGHTED_SAMPLE (config.py) is an")
+    print(f"    unverified placeholder bridging GPS-probe sample counts to")
+    print(f"    vehicle-km. This number scales linearly with that constant;")
+    print(f"    treat as illustrative/relative ranking, not a precise public figure,")
+    print(f"    until that conversion is verified against ADB's WeightedSample definition.")
     return gdf
 
 
@@ -322,19 +324,21 @@ def detect_corridors(
     grouped  = grouped[grouped["n_segments"] >= min_segments].copy()
 
     if len(grouped) == 0:
-        print("  No corridor groups with enough segments.")
+        print("  No intervention zone groups with enough segments.")
         return gpd.GeoDataFrame()
 
-    # Build representative geometry: convex hull of centroids per group
+    # Build representative geometry: unary_union of actual road line geometries
+    # (NOT convex hull of centroids — that creates giant polygons covering whole states)
     hr4326 = high_risk.to_crs(epsg=4326)
     hr4326["_cx"] = hr4326.geometry.centroid.x
     hr4326["_cy"] = hr4326.geometry.centroid.y
 
+    from shapely.ops import unary_union
     geom_map = {}
     for keys, sub in hr4326.groupby(group_keys):
         k = keys if isinstance(keys, tuple) else (keys,)
-        pts = MultiPoint(list(zip(sub["_cx"], sub["_cy"])))
-        geom_map[k] = pts.convex_hull if len(sub) > 2 else pts.centroid
+        # Use actual road geometries merged together, not convex hull
+        geom_map[k] = unary_union(sub.geometry.values)
 
     records = []
     for _, row in grouped.iterrows():
@@ -345,7 +349,12 @@ def detect_corridors(
     corridors = gpd.GeoDataFrame(records, crs="EPSG:4326")
     corridors = corridors.dropna(subset=["geometry"])
 
-    # Human-readable label
+    # Human-readable label. Column name kept as "corridor_label" internally
+    # (other modules reference it) but the VALUE and all printed/UI text
+    # say "Intervention Zone" — these are attribute groupings (country +
+    # region + road class + band), not spatially contiguous corridors, and
+    # calling them "corridors" overclaims contiguity a transport engineer
+    # would rightly question. See module docstring above.
     corridors["corridor_label"] = (
         corridors["country_code"].astype(str) + " | " +
         corridors["_region"].astype(str)       + " | " +
@@ -363,16 +372,18 @@ def detect_corridors(
     corridors["priority_rank"] = range(1, len(corridors) + 1)
     corridors["corridor_id"]   = range(1, len(corridors) + 1)
 
-    print(f"\n  ── High-Risk Corridor Groups (SSS >= {min_sss}) ──")
-    print(f"  Total corridor groups: {len(corridors)}")
+    print(f"\n  ── High-Risk Intervention Zones (SSS >= {min_sss}) ──")
+    print(f"  Total intervention zones: {len(corridors)}")
     print(f"  High-risk segments covered: {corridors['n_segments'].sum():,}")
+    print(f"  (Zones are attribute groups — country + region + road class + "
+          f"band — not spatially contiguous corridors. See docstring.)")
 
     show = ["priority_rank", "corridor_label", "n_segments", "sss"]
     if "nilsson_fatal_ratio" in corridors.columns: show.append("nilsson_fatal_ratio")
     if "est_lives_saved"     in corridors.columns: show.append("est_lives_saved")
     if "change_effort"       in corridors.columns: show.append("change_effort")
     show = [c for c in show if c in corridors.columns]
-    print(f"\n  Top 10 corridors:")
+    print(f"\n  Top 10 intervention zones:")
     print(corridors[show].head(10).round(2).to_string(index=False))
 
     return corridors
@@ -399,7 +410,7 @@ def run_advanced_scoring(gdf: gpd.GeoDataFrame) -> tuple:
     print("\n[D] Lives Saved Estimates (Nilsson + WHO fatality rates)...")
     gdf = lives_saved(gdf)
 
-    print("\n[E] High-Risk Corridor Detection...")
+    print("\n[E] High-Risk Intervention Zone Detection...")
     corridors = detect_corridors(gdf, min_sss=50.0, min_segments=3)
 
     print("\n" + "="*60)

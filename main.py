@@ -22,8 +22,12 @@ warnings.filterwarnings("ignore")
 
 from preprocessing    import load_maharashtra, load_thailand, load_helmet_data, \
                              merge_datasets, get_analysis_subset
-from scoring          import add_safe_system_limits, compute_speed_safety_score
+from scoring          import add_safe_system_limits, compute_speed_safety_score, \
+                             compute_alignment_only_score
+from ai_scoring import run_ai_scoring
 from advanced_scoring import run_advanced_scoring
+from enrichment import enrich_segments
+from priority_scoring import run_priority_scoring
 from evaluation       import run_full_evaluation, plot_score_overview
 from visualization    import build_interactive_map, export_for_esri, export_corridors
 
@@ -105,6 +109,7 @@ def run_demo_mode() -> gpd.GeoDataFrame:
             "analysis_status":   ["included"] * n,
             "has_speed_data":    [True] * n,
             "scoreable":         [True] * n,
+            "alignment_scoreable": [True] * n,
             "image_url":         ["https://www.mapillary.com"] * n,
             "urban_pct":         np.where(
                                      lus=="urban",
@@ -130,6 +135,22 @@ def print_policy_summary(gdf: gpd.GeoDataFrame, corridors: gpd.GeoDataFrame) -> 
     print("\n" + "="*60)
     print("  POLICY SUMMARY")
     print("="*60)
+
+    # Network coverage caveat — stated up front, not left for a reviewer to
+    # discover and ask about. The gap is a property of the source ADB data
+    # (most segments lack a sufficient GPS speed sample to compute F85/median
+    # — see AnalysisStatus/ForAnalysis in preprocessing.py), not a choice
+    # made by this methodology, but it should be visible either way.
+    total_segments = len(gdf)
+    n_scored = mask.sum()
+    n_tier1  = gdf["alignment_scoreable"].sum() if "alignment_scoreable" in gdf.columns else 0
+    print(f"\n  Network Coverage:")
+    print(f"    Tier 2 (full SSS, behaviourally confirmed): {n_scored:,} / "
+          f"{total_segments:,} segments ({100*n_scored/total_segments:.1f}%)")
+    print(f"    Tier 1 (limit-vs-Safe-System-standard only): {n_tier1:,} / "
+          f"{total_segments:,} segments ({100*n_tier1/total_segments:.1f}%)")
+    print(f"    Unscored:   {total_segments - n_tier1:,} segments lack even a posted "
+          f"limit — these are excluded, not scored as 'safe'.")
 
     # Nilsson
     if "nilsson_fatal_ratio" in df.columns:
@@ -165,21 +186,36 @@ def print_policy_summary(gdf: gpd.GeoDataFrame, corridors: gpd.GeoDataFrame) -> 
         upper = df["lives_saved_upper"].sum()
         print(f"\n  Estimated Annual Lives Saved (if all limits corrected):")
         print(f"    Central:  {total:.1f}   Range: {lower:.1f} – {upper:.1f}")
-        print(f"    (Order-of-magnitude proxy; assumptions documented)")
+        print(f"    ⚠ ILLUSTRATIVE, NOT VALIDATED — depends on an unverified")
+        print(f"    GPS-sample-to-vehicle-km conversion (config.VKM_PER_WEIGHTED_SAMPLE).")
+        print(f"    Use for RELATIVE comparison across segments, not as a public figure.")
 
-    # Corridors
+    # Priority Index (Exposure × Likelihood × Severity) — alongside SSS
+    if "priority_index" in df.columns:
+        print(f"\n  Priority Index (Exposure × Likelihood × Severity) — SECONDARY")
+        print(f"  'where to act first' layer. The Tier 1/2 scores above are the")
+        print(f"  primary answer to 'is this speed limit appropriate.'")
+        for cat in ["Critical", "High Risk", "Moderate", "Acceptable"]:
+            n = (df["priority_band"] == cat).sum()
+            if n:
+                print(f"    {cat:<22} {n:>6,}  ({100*n/len(df):.1f}%)")
+        print(f"    (Provisional bands — see config.PRIORITY_BANDS docstring "
+              f"on recalibrating against real data)")
+
+    # Intervention zones (attribute groups, not spatial corridors — see
+    # advanced_scoring.detect_corridors docstring)
     if corridors is not None and len(corridors):
         saved_col = "est_lives_saved" if "est_lives_saved" in corridors.columns else None
         total_corr_saved = corridors[saved_col].sum() if saved_col else 0
-        print(f"\n  High-Risk Corridors:")
-        print(f"    Corridors detected:  {len(corridors)}")
+        print(f"\n  High-Risk Intervention Zones:")
+        print(f"    Zones detected:      {len(corridors)}")
         print(f"    Segments covered:    {corridors['n_segments'].sum():,}")
         if saved_col:
-            print(f"    Lives saved (corr.): {total_corr_saved:.1f}/yr (central)")
+            print(f"    Lives saved (illustrative): {total_corr_saved:.1f}/yr (central)")
 
-        print(f"\n  Top 5 Priority Corridors:")
+        print(f"\n  Top 5 Priority Intervention Zones:")
         show = [c for c in ["priority_rank","country_code","n_segments",
-                             "corridor_length_km","sss",
+                             "corridor_label","sss",
                              "nilsson_fatal_ratio","est_lives_saved"]
                 if c in corridors.columns]
         print(corridors[show].head(5).round(2).to_string(index=False))
@@ -233,6 +269,18 @@ def main():
     print(f"\n{step_label} Computing Speed Safety Scores (base)...")
     combined = compute_speed_safety_score(combined)
 
+    # Tier 1 — alignment-only score (posted limit vs Safe System standard,
+    # no behavioural/GPS data required). Covers alignment_scoreable, a
+    # superset of the full-SSS `scoreable` mask. See preprocessing.py and
+    # scoring.compute_alignment_only_score docstrings.
+    combined = compute_alignment_only_score(combined)
+    n_t1 = combined["alignment_scoreable"].sum()
+    n_t2 = combined["scoreable"].sum()
+    print(f"\n  Tier 1 (alignment-only, no behavioural data needed): "
+          f"{n_t1:,} / {len(combined):,} segments ({100*n_t1/len(combined):.1f}%)")
+    print(f"  Tier 2 (full SSS, behaviourally confirmed):           "
+          f"{n_t2:,} / {len(combined):,} segments ({100*n_t2/len(combined):.1f}%)")
+
     # Quick SSS preview
     mask = combined["scoreable"] & combined["sss"].notna()
     if mask.any():
@@ -247,6 +295,19 @@ def main():
     step_label = "[4/6]" if args.demo else "[5/6]"
     print(f"\n{step_label} Running advanced scoring modules...")
     combined, corridors = run_advanced_scoring(combined)
+
+# AI anomaly detection (EXPERIMENTAL — not surfaced in map/popup/policy
+    # summary; kept for later phases, see ai_scoring.py module docstring)
+    print("\n[AI] Running Isolation Forest anomaly detection (experimental)...")
+    combined = run_ai_scoring(combined, output_dir=args.out)
+
+    # Exposure enrichment
+    print("\n[Enrichment] Building exposure score...")
+    combined = enrich_segments(combined, data_dir="enrichment_data")
+
+    # Priority Index (Exposure × Likelihood × Severity) — runs alongside SSS,
+    # does not replace it. See priority_scoring.py module docstring.
+    combined = run_priority_scoring(combined)
 
     # Print human-readable policy summary
     print_policy_summary(combined, corridors)
@@ -270,6 +331,7 @@ def main():
             corridors=corridors if (corridors is not None and len(corridors)) else None,
             output_path=f"{args.out}/speed_safety_map.html",
             max_segments=3000,
+            data_dir="enrichment_data",
         )
 
     export_for_esri(combined, output_dir=args.out)
