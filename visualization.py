@@ -565,6 +565,47 @@ def build_interactive_map(
                 pass
         fg_corr.add_to(m)
 
+    # ML-predicted layer (off by default — these are model estimates, not
+    # measured values; dashed style distinguishes them from scored segments)
+    if "ml_predicted_sss" in gdf.columns:
+        ml_segs = gdf[gdf["ml_predicted_sss"].notna()].copy()
+        if len(ml_segs):
+            if len(ml_segs) > max_segments:
+                ml_segs = ml_segs.sample(max_segments, random_state=42)
+            fg_ml = folium.FeatureGroup(
+                name="ML Predicted (unscored, off by default)", show=False
+            )
+            from config import BAND_COLORS
+            for _, row in ml_segs.iterrows():
+                coords = _geom_to_latlon_list(row.geometry)
+                if not coords:
+                    continue
+                band  = row.get("ml_predicted_band", "Moderate")
+                color = BAND_COLORS.get(band, "#888888")
+                score = row.get("ml_predicted_sss", float("nan"))
+                shap_feat = row.get("ml_shap_top_feature", "—")
+                conf  = row.get("ml_confidence", float("nan"))
+                popup_html = (
+                    f"<b>ML Predicted SSS: {score:.1f}</b> ({band})<br>"
+                    f"Road class: {row.get('road_class_norm','—')} | "
+                    f"{row.get('land_use','—')}<br>"
+                    f"Posted: {row.get('speed_limit','—')} km/h | "
+                    f"SS limit: {row.get('ss_limit','—')} km/h<br>"
+                    f"Top driver: {shap_feat}<br>"
+                    f"Confidence (std): {conf:.1f}<br>"
+                    f"<i>Estimate only — no GPS data for this segment</i>"
+                )
+                folium.PolyLine(
+                    coords,
+                    color=color,
+                    weight=2,
+                    opacity=0.6,
+                    dash_array="6 4",
+                    popup=folium.Popup(popup_html, max_width=300),
+                    tooltip=f"ML: {score:.0f} ({band})",
+                ).add_to(fg_ml)
+            fg_ml.add_to(m)
+
     folium.LayerControl(collapsed=False).add_to(m)
     m.save(output_path)
     print(f"\nInteractive map saved: {output_path}")

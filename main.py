@@ -34,6 +34,7 @@ from ai_scoring import run_ai_scoring
 from advanced_scoring import run_advanced_scoring
 from enrichment import enrich_segments
 from priority_scoring import run_priority_scoring
+from ml_extension     import run_ml_extension
 from evaluation       import run_full_evaluation, plot_score_overview
 from visualization    import build_interactive_map, export_for_esri, export_corridors
 
@@ -54,6 +55,7 @@ def parse_args():
     p.add_argument("--out",     default=OUTPUT_DIR)
     p.add_argument("--no-eval", action="store_true")
     p.add_argument("--no-map",  action="store_true")
+    p.add_argument("--no-ml",   action="store_true")
     p.add_argument("--demo",    action="store_true")
     return p.parse_args()
 
@@ -209,6 +211,17 @@ def print_policy_summary(gdf: gpd.GeoDataFrame, corridors: gpd.GeoDataFrame) -> 
         print(f"    (Provisional bands — see config.PRIORITY_BANDS docstring "
               f"on recalibrating against real data)")
 
+    # Uncovered risk: high-SSS roads that traffic-volume tools would miss
+    if "ranked_percentile" in df.columns and df["ranked_percentile"].notna().any():
+        rp_cutoff = df["ranked_percentile"].quantile(0.25)
+        n_uncovered = int(
+            ((df["sss"] >= 40) & (df["ranked_percentile"] <= rp_cutoff)).sum()
+        )
+        print(f"\n  Roads missed by traffic-volume prioritisation:")
+        print(f"    SSS >= 40 AND bottom 25% by traffic volume: {n_uncovered:,} segments")
+        print(f"    These are flagged by this model but would be de-prioritised")
+        print(f"    by approaches that rank roads only by traffic count.")
+
     # Intervention zones (attribute groups, not spatial corridors — see
     # advanced_scoring.detect_corridors docstring)
     if corridors is not None and len(corridors):
@@ -315,6 +328,10 @@ def main():
     # Priority Index (Exposure × Likelihood × Severity) — runs alongside SSS,
     # does not replace it. See priority_scoring.py module docstring.
     combined = run_priority_scoring(combined)
+
+    # ML coverage extension — predicts SSS for unscored segments
+    if not args.no_ml and not args.demo:
+        combined = run_ml_extension(combined, output_dir=args.out)
 
     # Print human-readable policy summary
     print_policy_summary(combined, corridors)

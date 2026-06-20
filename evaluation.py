@@ -16,7 +16,23 @@ from scoring import compute_speed_safety_score, add_safe_system_limits, WEIGHTS
 import priority_scoring
 
 
-def validate_against_adb_baseline(gdf: gpd.GeoDataFrame) -> dict:
+def compare_to_traffic_ranking(gdf: gpd.GeoDataFrame) -> dict:
+    """
+    Compare SSS to ADB's RankedPercentile (traffic volume ranking).
+
+    LOW correlation is the EXPECTED and DESIRED outcome here.
+    SSS answers "is this speed limit appropriate for this road?"
+    RankedPercentile answers "how much traffic uses this road?"
+    These are different questions. A road can be dangerously mis-posted
+    regardless of how much traffic it carries — that is exactly the point
+    of a speed-limit-appropriateness methodology.
+
+    A high rho would suggest SSS is just re-ranking by traffic volume,
+    which would mean it adds nothing beyond what ADB already has.
+    A low rho confirms SSS is measuring something different — limit
+    appropriateness — and will surface high-risk roads that volume-based
+    prioritisation misses (see uncovered_risk_analysis).
+    """
     mask = (
         gdf["scoreable"] &
         gdf["sss"].notna() &
@@ -27,7 +43,7 @@ def validate_against_adb_baseline(gdf: gpd.GeoDataFrame) -> dict:
     results = {"n_segments": len(df)}
 
     if len(df) < 3:
-        print("\n── Validation vs ADB Baseline ──")
+        print("\n── SSS vs Traffic Volume Ranking ──")
         print(f"  Too few segments ({len(df)}) for correlation — skipping")
         results.update({"spearman_rho": np.nan, "p_value": np.nan,
                         "interpretation": "Insufficient data"})
@@ -38,9 +54,14 @@ def validate_against_adb_baseline(gdf: gpd.GeoDataFrame) -> dict:
         "spearman_rho": round(float(rho), 4),
         "p_value": round(float(pval), 6),
         "interpretation": (
-            "Strong agreement with ADB baseline" if abs(rho) > 0.7 else
-            "Moderate agreement — SSS adds new information" if abs(rho) > 0.4 else
-            "Low correlation — SSS captures different risk dimensions"
+            "Expected: SSS and traffic volume are different signals — "
+            "SSS surfaces limit-appropriateness risk that volume rankings miss."
+            if abs(rho) < 0.3 else
+            "Moderate overlap — SSS and traffic volume partially agree, "
+            "but SSS still adds new information."
+            if abs(rho) < 0.6 else
+            "High overlap — SSS may be partially proxying traffic volume; "
+            "review whether volume is inadvertently driving scores."
         )
     })
 
@@ -50,13 +71,26 @@ def validate_against_adb_baseline(gdf: gpd.GeoDataFrame) -> dict:
             r, p = stats.spearmanr(sub["sss"], sub["ranked_percentile"])
             results[f"spearman_rho_{cc}"] = round(float(r), 4)
 
-    print("\n── Validation vs ADB Baseline ──")
+    print("\n── SSS vs Traffic Volume Ranking (RankedPercentile) ──")
+    print(f"  Note: low rho is EXPECTED — SSS measures limit appropriateness,")
+    print(f"  RankedPercentile measures traffic volume. Different questions.")
     for k, v in results.items():
         print(f"  {k}: {v}")
     return results
 
 
 def top_segment_overlap(gdf: gpd.GeoDataFrame, top_pct: float = 0.20) -> dict:
+    """
+    Compare which segments each method puts in the top X%.
+
+    LOW overlap is the DESIRED outcome: it means SSS is surfacing
+    high-risk roads that a traffic-volume tool (RankedPercentile) would
+    not prioritise. These are exactly the roads that a speed-limit
+    appropriateness methodology is supposed to find.
+
+    High overlap would indicate SSS is selecting mostly the same roads
+    as traffic volume — meaning it adds little over existing tools.
+    """
     mask = (
         gdf["scoreable"] &
         gdf["sss"].notna() &
@@ -67,7 +101,7 @@ def top_segment_overlap(gdf: gpd.GeoDataFrame, top_pct: float = 0.20) -> dict:
     results = {"top_pct": top_pct, "n_total_scored": len(df)}
 
     if len(df) < 10:
-        print(f"\n── Top-{int(top_pct*100)}% Overlap ──")
+        print(f"\n── Top-{int(top_pct*100)}% Coverage Comparison ──")
         print(f"  Too few segments ({len(df)}) — skipping")
         results.update({"overlap_count": 0, "jaccard_similarity": np.nan})
         return results
@@ -78,14 +112,20 @@ def top_segment_overlap(gdf: gpd.GeoDataFrame, top_pct: float = 0.20) -> dict:
     union   = our_top | adb_top
     overlap = len(our_top & adb_top)
     jaccard = overlap / len(union) if union else 0.0
+    unique_to_sss = n_top - overlap
 
     results.update({
         "n_in_top": n_top,
         "overlap_count": overlap,
         "overlap_pct": round(overlap / n_top * 100, 1),
         "jaccard_similarity": round(jaccard, 4),
+        "unique_to_sss": unique_to_sss,
     })
-    print(f"\n── Top-{int(top_pct*100)}% Overlap with ADB ──")
+    print(f"\n── Top-{int(top_pct*100)}% Coverage: SSS vs Traffic Volume ──")
+    print(f"  SSS uniquely flags {unique_to_sss:,} high-risk segments "
+          f"that traffic-volume ranking would miss.")
+    print(f"  Low overlap ({100-results['overlap_pct']:.0f}% non-overlapping) = "
+          f"SSS is adding new information, not re-ranking by volume.")
     for k, v in results.items():
         print(f"  {k}: {v}")
     return results
@@ -236,6 +276,63 @@ def export_manual_review_sample(
     return review
 
 
+def uncovered_risk_analysis(
+    gdf: gpd.GeoDataFrame,
+    sss_threshold: float = 40.0,
+    volume_percentile: float = 0.25,
+) -> dict:
+    """
+    Find segments flagged as high-risk by SSS that traffic-volume tools
+    would de-prioritise: SSS >= sss_threshold AND ranked_percentile in
+    the bottom volume_percentile of the network.
+
+    These are the roads a volume-based approach would leave unaddressed.
+    They are the core argument for why a speed-limit-appropriateness
+    methodology adds value over simply acting on high-traffic corridors.
+    """
+    mask = gdf["scoreable"] & gdf["sss"].notna()
+    df = gdf[mask].copy()
+
+    results = {"sss_threshold": sss_threshold, "n_scored": len(df)}
+
+    if "ranked_percentile" not in df.columns or df["ranked_percentile"].isna().all():
+        print("\n── Uncovered Risk Analysis ──")
+        print("  ranked_percentile not available — skipping")
+        results["n_uncovered"] = 0
+        return results
+
+    rp_cutoff = df["ranked_percentile"].quantile(volume_percentile)
+    uncovered = df[
+        (df["sss"] >= sss_threshold) &
+        (df["ranked_percentile"] <= rp_cutoff)
+    ]
+
+    pct_of_scored = 100 * len(uncovered) / len(df) if len(df) else 0
+
+    results.update({
+        "n_uncovered": len(uncovered),
+        "pct_of_scored": round(pct_of_scored, 1),
+        "volume_percentile_cutoff": round(float(rp_cutoff), 1),
+    })
+
+    print(f"\n── Uncovered Risk Analysis ──")
+    print(f"  Roads with SSS >= {sss_threshold} AND in bottom "
+          f"{int(volume_percentile*100)}% by traffic volume:")
+    print(f"  {len(uncovered):,} segments ({pct_of_scored:.1f}% of scored network)")
+    print(f"  These roads would be MISSED by traffic-volume prioritisation.")
+
+    if len(uncovered) > 0:
+        show_cols = [c for c in [
+            "segment_id", "country_code", "road_class_norm", "land_use",
+            "sss", "sss_band", "speed_limit", "ss_limit", "ranked_percentile",
+        ] if c in uncovered.columns]
+        top5 = uncovered.nlargest(5, "sss")[show_cols]
+        print(f"\n  Top 5 uncovered high-risk segments:")
+        print(top5.to_string(index=False))
+
+    return results
+
+
 def run_full_evaluation(gdf: gpd.GeoDataFrame, output_dir: str = ".") -> dict:
     print("\n" + "="*60)
     print("  SPEED SAFETY SCORE — EVALUATION REPORT")
@@ -243,22 +340,24 @@ def run_full_evaluation(gdf: gpd.GeoDataFrame, output_dir: str = ".") -> dict:
 
     score_diagnostics(gdf)
 
-    baseline = validate_against_adb_baseline(gdf)
-    overlap  = top_segment_overlap(gdf, top_pct=0.20)
-    sens_df  = sensitivity_analysis(gdf)
-    cc_df    = cross_country_consistency(gdf)
-    review_df = export_manual_review_sample(gdf, output_dir=output_dir, n=20, score_col="sss")
+    baseline   = compare_to_traffic_ranking(gdf)
+    overlap    = top_segment_overlap(gdf, top_pct=0.20)
+    uncovered  = uncovered_risk_analysis(gdf)
+    sens_df    = sensitivity_analysis(gdf)
+    cc_df      = cross_country_consistency(gdf)
+    review_df  = export_manual_review_sample(gdf, output_dir=output_dir, n=20, score_col="sss")
 
     if not sens_df.empty:
         sens_df.to_csv(f"{output_dir}/sensitivity_analysis.csv", index=False)
     cc_df.to_csv(f"{output_dir}/cross_country_consistency.csv")
 
     results = {
-        "baseline_validation": baseline,
-        "top20_overlap":       overlap,
-        "sensitivity":         sens_df,
-        "cross_country":       cc_df,
-        "manual_review_sample": review_df,
+        "traffic_ranking_comparison": baseline,
+        "top20_overlap":              overlap,
+        "uncovered_risk":             uncovered,
+        "sensitivity":                sens_df,
+        "cross_country":              cc_df,
+        "manual_review_sample":       review_df,
     }
 
     # Priority Index evaluation — runs only if priority_scoring.py has already
@@ -345,8 +444,8 @@ def plot_score_overview(gdf: gpd.GeoDataFrame, output_path: str = "score_overvie
         s = sub_rank[sub_rank["country_code"] == cc]
         if len(s):
             ax4.scatter(s["ranked_percentile"], s["sss"], alpha=0.3, s=5, c=color, label=cc)
-    ax4.set_xlabel("ADB RankedPercentile"); ax4.set_ylabel("SSS")
-    ax4.set_title("SSS vs ADB Baseline"); ax4.legend(markerscale=3)
+    ax4.set_xlabel("RankedPercentile (traffic volume)"); ax4.set_ylabel("SSS")
+    ax4.set_title("SSS vs Traffic Volume Rank"); ax4.legend(markerscale=3)
 
     # 5. Speed gap vs SSS
     ax5 = fig.add_subplot(gs[1, 1])
@@ -371,8 +470,8 @@ def plot_score_overview(gdf: gpd.GeoDataFrame, output_path: str = "score_overvie
         data = [plot_df[plot_df["road_class_norm"] == o]["sss"].dropna().values for o in order]
         data = [d for d in data if len(d)]
         if data:
-            ax6.boxplot(data, labels=order[:len(data)], patch_artist=True, showfliers=False)
-            ax6.set_xticklabels(order[:len(data)], rotation=30, ha="right", fontsize=8)
+            ax6.boxplot(data, tick_labels=order[:len(data)], patch_artist=True, showfliers=False)
+            ax6.tick_params(axis="x", labelrotation=30, labelsize=8)
     ax6.set_ylabel("SSS"); ax6.set_title("SSS by Road Class")
 
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
