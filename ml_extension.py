@@ -179,7 +179,30 @@ def run_ml_extension(
         print(f"    Fold {fold}: RMSE = {rmse_fold:.2f}")
 
     cv_rmse = float(np.sqrt(np.nanmean((oof - y_train) ** 2)))
-    print(f"  CV RMSE (overall): {cv_rmse:.2f}  (target < 15)")
+    r2 = float(1 - np.nansum((oof - y_train)**2) / np.nansum((y_train - y_train.mean())**2))
+    print(f"  CV RMSE (overall): {cv_rmse:.2f}  (target < 15)   R²={r2:.3f}")
+
+    # OOF scatter plot — predicted vs actual SSS for all training segments
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        fig, ax = plt.subplots(figsize=(6, 6))
+        ax.scatter(y_train, oof, alpha=0.25, s=10, color="#4f9fd4", linewidths=0)
+        mn, mx = 0, 100
+        ax.plot([mn, mx], [mn, mx], "k--", linewidth=1, label="Perfect prediction")
+        ax.set_xlabel("Actual SSS (Tier 2 measured)", fontsize=11)
+        ax.set_ylabel("Predicted SSS (OOF cross-validation)", fontsize=11)
+        ax.set_title(f"XGBoost SSS Predictor — Validation\nCV RMSE={cv_rmse:.2f}  R²={r2:.3f}", fontsize=12)
+        ax.set_xlim(mn, mx); ax.set_ylim(mn, mx)
+        ax.legend(fontsize=10)
+        scatter_path = Path(output_dir) / "ml_validation_scatter.png"
+        fig.tight_layout()
+        fig.savefig(scatter_path, dpi=150)
+        plt.close(fig)
+        print(f"  Saved: {scatter_path.name}")
+    except Exception as e:
+        print(f"  (Scatter plot skipped: {e})")
 
     # Final model trained on all labelled data
     final_model = xgb.XGBRegressor(**XGB_PARAMS)

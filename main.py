@@ -354,7 +354,8 @@ def main():
             combined,
             corridors=corridors if (corridors is not None and len(corridors)) else None,
             output_path=f"{args.out}/speed_safety_map.html",
-            max_segments=3000,
+            max_segments=1000,
+            max_amenity_markers=2000,
             data_dir="enrichment_data",
         )
 

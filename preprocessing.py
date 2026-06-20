@@ -84,6 +84,32 @@ def _normalize_land_use(series: pd.Series) -> pd.Series:
     )
 
 
+def _bbox_to_streetview_url(raw: str) -> str:
+    """
+    StreetImageLink in both ADB GeoJSONs stores segment endpoint coordinates as
+    "lon1,lat1,lon2,lat2" (per the ADB data guide: "Lat/Lon for Google StreetView").
+    Convert to a Google Maps Street View URL centred on the midpoint.
+    No API key required for this URL format.
+    Returns empty string if the value can't be parsed.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    try:
+        parts = [float(x) for x in raw.split(",")]
+        if len(parts) == 4:
+            lon = (parts[0] + parts[2]) / 2
+            lat = (parts[1] + parts[3]) / 2
+        elif len(parts) == 2:
+            lon, lat = parts
+        else:
+            return ""
+        if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+            return ""
+        return f"https://maps.google.com/maps?layer=c&cbll={lat:.6f},{lon:.6f}"
+    except (ValueError, TypeError):
+        return ""
+
+
 def _parse_speed_limit(series: pd.Series) -> pd.Series:
     """Convert any SpeedLimit representation to numeric km/h."""
     s = series.copy().astype(str).str.strip()
@@ -230,6 +256,11 @@ def merge_datasets(mh: gpd.GeoDataFrame, th: gpd.GeoDataFrame) -> gpd.GeoDataFra
         pd.concat([_keep(mh), _keep(th)], ignore_index=True),
         crs="EPSG:4326"
     )
+
+    # Convert raw StreetImageLink bbox coords to Google Street View URLs
+    if "image_url" in combined.columns:
+        mask = combined["image_url"].notna() & ~combined["image_url"].astype(str).str.startswith("http")
+        combined.loc[mask, "image_url"] = combined.loc[mask, "image_url"].apply(_bbox_to_streetview_url)
 
     # Diagnostic
     print(f"\nCombined dataset: {len(combined):,} total segments")

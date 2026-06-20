@@ -333,6 +333,61 @@ def uncovered_risk_analysis(
     return results
 
 
+def weight_sensitivity_test(gdf: gpd.GeoDataFrame, delta: float = 0.10) -> dict:
+    """
+    Perturb each SSS sub-weight by ±delta (default ±10%) while keeping
+    the other two unchanged (renormalised to sum to 1). Compute Spearman ρ
+    between the perturbed ranking and the baseline ranking.
+
+    Per the project brief: ρ ≥ 0.95 signals the formula is robust to
+    reasonable weight choices and that no single weight drives the ranking.
+    """
+    scored = gdf[gdf["scoreable"] & gdf["sss"].notna()].copy()
+    if len(scored) < 50:
+        print("  (Weight sensitivity: too few scored segments, skipping)")
+        return {}
+
+    base_sss = scored["sss"].values
+    sub_cols = {
+        "alignment":   "sub_score_limit_alignment",
+        "credibility": "sub_score_limit_credibility",
+        "vru":         "sub_score_vru_risk",
+    }
+    weight_key_map = {
+        "alignment":   "speed_limit_alignment",
+        "credibility": "limit_credibility_gap",
+        "vru":         "vru_context_risk",
+    }
+    base_w = {k: float(WEIGHTS.get(weight_key_map[k], 1/3)) for k in sub_cols}
+
+    results = {}
+    print("\n  Weight Sensitivity Test (±10% perturbation):")
+    print(f"  {'Component':<14} {'Direction':<10} {'Weight change':<18} {'Spearman ρ':<12} {'Stable?'}")
+    print(f"  {'-'*65}")
+    for comp, col in sub_cols.items():
+        if col not in scored.columns:
+            continue
+        for sign, label in [(+1, "+10%"), (-1, "-10%")]:
+            new_w = dict(base_w)
+            new_w[comp] = base_w[comp] * (1 + sign * delta)
+            total = sum(new_w.values())
+            new_w = {k: v / total for k, v in new_w.items()}
+            perturbed = sum(
+                new_w[k] * scored[sub_cols[k]].fillna(0).values
+                for k in sub_cols
+                if sub_cols[k] in scored.columns
+            )
+            rho, _ = stats.spearmanr(base_sss, perturbed)
+            stable = "✓" if rho >= 0.95 else "✗ CHECK"
+            w_str = f"{base_w[comp]:.0%}→{new_w[comp]:.0%}"
+            print(f"  {comp:<14} {label:<10} {w_str:<18} {rho:.4f}       {stable}")
+            results[f"{comp}_{label}"] = float(rho)
+
+    all_stable = all(v >= 0.95 for v in results.values())
+    print(f"\n  Overall: {'STABLE — ranking robust to ±10% weight changes' if all_stable else 'UNSTABLE — review weights'}")
+    return results
+
+
 def run_full_evaluation(gdf: gpd.GeoDataFrame, output_dir: str = ".") -> dict:
     print("\n" + "="*60)
     print("  SPEED SAFETY SCORE — EVALUATION REPORT")
@@ -343,6 +398,7 @@ def run_full_evaluation(gdf: gpd.GeoDataFrame, output_dir: str = ".") -> dict:
     baseline   = compare_to_traffic_ranking(gdf)
     overlap    = top_segment_overlap(gdf, top_pct=0.20)
     uncovered  = uncovered_risk_analysis(gdf)
+    weight_sens = weight_sensitivity_test(gdf)
     sens_df    = sensitivity_analysis(gdf)
     cc_df      = cross_country_consistency(gdf)
     review_df  = export_manual_review_sample(gdf, output_dir=output_dir, n=20, score_col="sss")
@@ -355,6 +411,7 @@ def run_full_evaluation(gdf: gpd.GeoDataFrame, output_dir: str = ".") -> dict:
         "traffic_ranking_comparison": baseline,
         "top20_overlap":              overlap,
         "uncovered_risk":             uncovered,
+        "weight_sensitivity":         weight_sens,
         "sensitivity":                sens_df,
         "cross_country":              cc_df,
         "manual_review_sample":       review_df,

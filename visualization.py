@@ -221,11 +221,35 @@ def _build_popup_html(row: pd.Series) -> str:
     """
 
 
+def _priority_sample(df: pd.DataFrame, max_n: int, band_col: str = "sss_band",
+                     random_state: int = 42) -> pd.DataFrame:
+    """
+    Sample up to max_n rows, always keeping ALL Critical segments first,
+    then filling remaining slots with High Risk, Moderate, Acceptable in order.
+    Ensures the map always shows the most dangerous roads even when sampling.
+    """
+    if len(df) <= max_n:
+        return df
+    order = ["Critical", "High Risk", "Moderate", "Acceptable"]
+    kept, budget = [], max_n
+    for band in order:
+        if budget <= 0:
+            break
+        grp = df[df[band_col] == band] if band_col in df.columns else df
+        if len(grp) <= budget:
+            kept.append(grp)
+            budget -= len(grp)
+        else:
+            kept.append(grp.sample(budget, random_state=random_state))
+            budget = 0
+    return pd.concat(kept) if kept else df.sample(max_n, random_state=random_state)
+
+
 def build_interactive_map(
     gdf: gpd.GeoDataFrame,
     corridors: gpd.GeoDataFrame = None,
     output_path: str = "speed_safety_map.html",
-    max_segments: int = 5000,
+    max_segments: int = 2000,
     data_dir: str = "enrichment_data",
     max_amenity_markers: int = 6000,
 ) -> folium.Map:
@@ -276,10 +300,10 @@ def build_interactive_map(
         country_name = country_sub["country"].iloc[0]
         fg = folium.FeatureGroup(name=f"📍 {country_name}", show=True)
 
-        plot_sub = country_sub
-        if len(country_sub) > max_segments:
-            plot_sub = country_sub.sample(max_segments, random_state=42)
-            print(f"  Sampling {max_segments:,} of {len(country_sub):,} {country_code} segments for map performance")
+        plot_sub = _priority_sample(country_sub, max_segments, band_col="sss_band")
+        if len(plot_sub) < len(country_sub):
+            print(f"  Sampling {len(plot_sub):,} of {len(country_sub):,} {country_code} segments "
+                  f"(priority: all Critical first)")
 
         for _, row in plot_sub.iterrows():
             geom   = row.geometry
@@ -606,7 +630,7 @@ def build_interactive_map(
                 ).add_to(fg_ml)
             fg_ml.add_to(m)
 
-    folium.LayerControl(collapsed=False).add_to(m)
+    folium.LayerControl(collapsed=True, position="topright").add_to(m)
     m.save(output_path)
     print(f"\nInteractive map saved: {output_path}")
     return m
@@ -748,13 +772,33 @@ def _build_summary_html(scored: gpd.GeoDataFrame, full_gdf: gpd.GeoDataFrame,
             </table>
             {corr_txt}"""
 
+    # ML coverage note
+    ml_row = ""
+    if "ml_predicted_sss" in full_gdf.columns:
+        n_ml = int(full_gdf["ml_predicted_sss"].notna().sum())
+        if n_ml:
+            ml_row = (
+                f'<br><b style="color:#c4b5fd">🤖 ML Coverage Extension:</b> {n_ml:,} unscored segments '
+                f'predicted (toggle layer below)<br>'
+                f'<span style="color:#aaa;font-size:11px">XGBoost trained on Tier 2 labels — '
+                f'triage only, not for enforcement</span>'
+            )
+
     return f"""
-    <div style="position:fixed;top:12px;right:12px;z-index:9999;
+    <div id="summary-panel" style="position:fixed;top:52px;right:12px;z-index:9990;
                 background:rgba(30,30,30,0.92);color:white;
-                padding:14px 18px;border-radius:8px;font-family:Arial,sans-serif;
-                font-size:12px;box-shadow:0 2px 12px rgba(0,0,0,0.4);min-width:240px">
-      <b style="font-size:14px">Analysis Summary</b>
-      <hr style="border-color:#555;margin:6px 0">
+                padding:10px 14px;border-radius:8px;font-family:Arial,sans-serif;
+                font-size:12px;box-shadow:0 2px 12px rgba(0,0,0,0.4);min-width:220px;
+                max-height:80vh;overflow-y:auto">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+        <b style="font-size:13px">Analysis Summary</b>
+        <span onclick="var b=document.getElementById('summary-body');
+                       b.style.display=b.style.display=='none'?'block':'none'"
+              style="cursor:pointer;font-size:16px;line-height:1;padding:0 4px"
+              title="Collapse/expand">⊟</span>
+      </div>
+      <div id="summary-body">
+      <hr style="border-color:#555;margin:4px 0">
       <b>Total scored segments (Tier 2, full SSS):</b> {total:,}<br><br>
       <table style="width:100%;border-collapse:collapse">
         <tr style="color:#aaa"><td>Band</td><td style="text-align:right">N</td><td style="text-align:right">%</td></tr>
@@ -772,6 +816,8 @@ def _build_summary_html(scored: gpd.GeoDataFrame, full_gdf: gpd.GeoDataFrame,
       </div>
       {tier1_row}
       {pi_row}
+      {ml_row}
+      </div>
     </div>
     """
 
