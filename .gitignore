@@ -1,7 +1,8 @@
-AI for Safer Roads 2026 - Dataset/
 outputs/
 codeTester.ipynb
 __pycache__/
 *.pyc
 .env/
 env/
+.venv/
+data/

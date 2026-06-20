@@ -9,10 +9,16 @@ Usage:
 """
 
 import argparse
+import io
 import sys
 import warnings
 from pathlib import Path
 from datetime import datetime
+
+# Fix Windows CP1252 terminal crash on Unicode box-drawing chars in print statements
+if hasattr(sys.stdout, "buffer") and sys.stdout.encoding.lower() not in ("utf-8", "utf-8-sig"):
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 import numpy as np
 import pandas as pd
@@ -32,10 +38,11 @@ from evaluation       import run_full_evaluation, plot_score_overview
 from visualization    import build_interactive_map, export_for_esri, export_corridors
 
 BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "data"
 
-DEFAULT_MH_PATH     = BASE_DIR / "AI for Safer Roads 2026 - Dataset" / "ADB_Innovation_Maharashtra.geojson"
-DEFAULT_TH_PATH     = BASE_DIR / "AI for Safer Roads 2026 - Dataset" / "ADB_Innovation_Thailand.geojson"
-DEFAULT_HELMET_PATH = BASE_DIR / "AI for Safer Roads 2026 - Dataset" / "Archive" / "Road_Safety_Performance_Indicators_(Helmet_Wearing_results)_(adb_dashboard_data_v02).xlsx"
+DEFAULT_MH_PATH     = DATA_DIR / "ADB_Innovation_Maharashtra.geojson"
+DEFAULT_TH_PATH     = DATA_DIR / "ADB_Innovation_Thailand.geojson"
+DEFAULT_HELMET_PATH = DATA_DIR / "Archive" / "Road_Safety_Performance_Indicators_(Helmet_Wearing_results)_(adb_dashboard_data_v02).xlsx"
 OUTPUT_DIR          = BASE_DIR / "outputs"
 
 

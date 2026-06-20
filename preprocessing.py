@@ -63,6 +63,7 @@ TH_COLUMN_ALIASES = {
     "InvPercentile":         "inv_percentile",
     "ProvinceID":            "province_id",
     "AnalysisStatus":        "analysis_status",
+    "ExcludeFromSpeedSPI":   "exclude_flag",
     "StreetImageLink":       "image_url",
     "NO_OF_Result_Segments": "n_result_segments",
     "SampleSizeTotal":       "sample_size_total",
@@ -124,11 +125,7 @@ def load_maharashtra(filepath: str) -> gpd.GeoDataFrame:
     # Speed limit
     if "speed_limit_raw" in gdf.columns:
         gdf["speed_limit"] = _parse_speed_limit(gdf["speed_limit_raw"])
-    if "speed_limit_floor" in gdf.columns and "speed_limit" in gdf.columns:
-        # Fill any remaining NaN speed_limit from floor
-        gdf["speed_limit"] = gdf["speed_limit"].fillna(
-            pd.to_numeric(gdf["speed_limit_floor"], errors="coerce")
-        )
+    # SpeedLimitFloor fallback removed — data user guide says ignore this field.
 
     # Road class + land use
     if "road_class" in gdf.columns:
@@ -179,10 +176,7 @@ def load_thailand(filepath: str) -> gpd.GeoDataFrame:
     # Speed limit
     if "speed_limit_raw" in gdf.columns:
         gdf["speed_limit"] = pd.to_numeric(gdf["speed_limit_raw"], errors="coerce")
-    if "speed_limit_floor" in gdf.columns:
-        gdf["speed_limit"] = gdf.get("speed_limit", pd.Series(dtype=float)).fillna(
-            pd.to_numeric(gdf["speed_limit_floor"], errors="coerce")
-        )
+    # SpeedLimitFloor fallback removed — data user guide says ignore this field.
 
     if "road_class" in gdf.columns:
         gdf["road_class_norm"] = _normalize_road_class(gdf["road_class"])
@@ -220,7 +214,7 @@ def merge_datasets(mh: gpd.GeoDataFrame, th: gpd.GeoDataFrame) -> gpd.GeoDataFra
         "pct_over_limit", "n_over_limit",
         "sample_size", "sample_size_total", "weighted_sample",
         "ranked_percentile", "percentile_band",
-        "analysis_status", "has_speed_data",
+        "analysis_status", "exclude_flag", "has_speed_data",
         "image_url", "geometry",
     ]
     for col in ["urban_pct", "province_id", "road_length_m"]:
@@ -299,8 +293,23 @@ def get_analysis_subset(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     has_median     = gdf["median_speed"].notna() if "median_speed" in gdf.columns \
                      else pd.Series(True, index=gdf.index)
 
-    gdf["scoreable"]            = has_speed_data & has_limit & has_85th
-    gdf["alignment_scoreable"]  = has_limit   # Tier 1 — posted limit alone
+    # Honour ADB's ExcludeFromSpeedSPI flag — MH is 0/1 numeric, TH may be "YES"/"NO" string
+    if "exclude_flag" in gdf.columns:
+        excl = gdf["exclude_flag"]
+        not_excluded = ~(
+            (excl == 1) |
+            (excl.astype(str).str.upper().isin(["YES", "1", "TRUE"]))
+        )
+        not_excluded = not_excluded.fillna(True)  # NaN = no flag = not excluded
+    else:
+        not_excluded = pd.Series(True, index=gdf.index)
+
+    # ExcludeFromSpeedSPI is ADB's flag for speed-behaviour data quality issues.
+    # Tier 2 (full SSS uses F85/median speed) → respect the flag.
+    # Tier 1 (alignment-only, posted limit vs Safe System standard, no speed data) → ignore it;
+    # a bad speed sample doesn't make the posted limit invalid.
+    gdf["scoreable"]           = has_speed_data & has_limit & has_85th & not_excluded
+    gdf["alignment_scoreable"] = has_limit  # Tier 1 — posted limit alone, flag irrelevant
 
     # Diagnostic breakdown
     n_zero_limit = int((gdf["speed_limit"] == 0).sum()) if "speed_limit" in gdf.columns else 0

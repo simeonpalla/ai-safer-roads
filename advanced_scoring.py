@@ -166,6 +166,16 @@ def recommend_limit(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         gdf.loc[mask, "limit_change_needed"].apply(_effort)
     )
 
+    # Under-Speed: F85 far below posted limit → poor surface, heavy trucks, bad geometry.
+    # floor(F85/10)*10 gives nonsensical recommendations (e.g. 20 km/h on a rural trunk).
+    # The right response is investigation, not a lower limit.
+    if "credibility_class" in gdf.columns:
+        under_speed = mask & (gdf["credibility_class"] == "Under-Speed")
+        if under_speed.any():
+            gdf.loc[under_speed, "recommended_limit"]   = np.nan
+            gdf.loc[under_speed, "limit_change_needed"] = np.nan
+            gdf.loc[under_speed, "change_effort"]       = "Investigate road condition"
+
     print(f"\n  Limit change effort breakdown:")
     counts = gdf.loc[mask, "change_effort"].value_counts()
     total  = counts.sum()
