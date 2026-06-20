@@ -304,7 +304,7 @@ def _classify_band(score: float) -> str:
     for band, (lo, hi) in SCORE_BANDS.items():
         if lo <= score < hi:
             return band
-    return "Critical" if score >= 52 else "Acceptable"
+    return "Critical" if score >= max(lo for lo, _ in SCORE_BANDS.values()) else "Acceptable"
 
 
 def _generate_recommendation(row: pd.Series) -> str:

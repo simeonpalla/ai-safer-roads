@@ -186,11 +186,9 @@ def load_thailand(filepath: str) -> gpd.GeoDataFrame:
     # ── KEY FIX: derive has_speed_data from actual column content ──────────
     gdf["has_speed_data"] = _derive_has_speed_data(gdf)
 
-    # Also set using ForAnalysis if available (as secondary check)
-    if "for_analysis" in gdf.columns:
-        fa = pd.to_numeric(gdf["for_analysis"], errors="coerce")
-        gdf["has_speed_data"] = gdf["has_speed_data"] | (fa == 1)
-        print(f"  for_analysis == 1 count: {(fa == 1).sum()}")
+    # ForAnalysis in the TH GeoJSON contains speed-limit-like values (30/50/80/90 km/h),
+    # NOT a binary 0/1 flag. The column-content check in _derive_has_speed_data() is the
+    # correct authority for has_speed_data; no secondary check needed here.
 
     n_speed = gdf["has_speed_data"].sum()
     n_limit = gdf["speed_limit"].notna().sum() if "speed_limit" in gdf.columns else 0

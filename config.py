@@ -174,31 +174,66 @@ LAND_USE_MAP = {
 # they're correct — those are different claims.)
 
 # ─── Score band thresholds ────────────────────────────────────────────────────
-# RECALIBRATED v2.1 against real data (mean=32.1, std=16.5, max=74.8):
-#   Target: ~10% Critical, ~20% High Risk, ~30% Moderate, ~40% Acceptable
-#   Percentile analysis on real distribution:
-#     90th pct ≈ 53  → Critical >= 52
-#     70th pct ≈ 41  → High Risk >= 40
-#     40th pct ≈ 28  → Moderate >= 27
+# ANCHORED TO SUB-SCORE MEANING (v3.2, June 2026) — not percentile-based.
 #
-#   Policy rationale for Critical>=52:
-#     TH urban primary/secondary mean SSS ~50-51 → correctly flagged Critical
-#     MH rural primary mean SSS ~19 → correctly Acceptable (posted=80, SS=70)
-#     TH trunk urban mean SSS ~49 → High Risk/Critical boundary
+# SSS = 0.38 × align + 0.30 × cred + 0.32 × vru
 #
-#   HONESTY NOTE (v3.1): these cutoffs are percentiles of the score's OWN
-#   distribution — "Critical" is defined as roughly the top 10% of this
-#   score, not validated against any external outcome (crash/fatality
-#   data). That's the best available given no outcome data exists for
-#   this dataset; it is NOT the same claim as "these roads are critical
-#   because crashes happen here." See evaluation.export_manual_review_sample()
-#   for a cheap partial substitute (manual engineer review of top/bottom
-#   scored segments against street imagery).
+# The VRU sub-score already encodes area type:
+#   urban secondary:  vru ≈ 75  →  floor contribution = 0.32 × 75 = 24 pts
+#   rural motorway:   vru ≈ 29  →  floor contribution = 0.32 × 29 =  9 pts
+# So the SAME alignment problem scores higher on urban roads than rural —
+# you do NOT need separate thresholds per road class or land use.
+#
+# What each threshold means physically:
+#
+#   Acceptable (0–35):
+#     Only VRU baseline is present; alignment and credibility components are
+#     near-zero. The max VRU floor is 0.32 × 100 = 32 pts, so SSS ≤ 35 means
+#     the posted limit is broadly correct for the road's Safe System context.
+#     Example: rural trunk posted 90 km/h (ss_limit = 90) → SSS ≈ 15 ✓
+#
+#   Moderate (35–52):
+#     Limit is moderately above the Safe System standard (up to ~25% excess)
+#     OR an emerging credibility gap is beginning to appear.
+#     Example: urban secondary posted 60 km/h (ss_limit = 50, 20% excess),
+#              F85 = 63 (small gap) → SSS ≈ 40 ✓
+#
+#   High Risk (52–65):
+#     Clear alignment violation (limit ≥ 25–35% above Safe System standard)
+#     AND/OR significant credibility gap, in a medium-to-high VRU context.
+#     Example: urban secondary posted 70 km/h (ss_limit = 50, 40% excess),
+#              F85 = 72 (small gap) → SSS ≈ 54 ✓
+#
+#   Critical (65–100):
+#     Limit is substantially misaligned (≥ 35–50% above Safe System standard,
+#     depending on VRU context) AND behavioral data shows the limit is not
+#     working. Requires both alignment and credibility components to be high
+#     simultaneously, except on very high VRU roads.
+#     Example: urban secondary posted 80 km/h (ss_limit = 50, 60% excess),
+#              F85 = 103 (gap = 23 km/h, non-credible) → SSS ≈ 94 ✓
+#     Example: rural primary posted 100 km/h (ss_limit = 70, 43% excess),
+#              F85 = 108 (gap = 28 km/h, non-credible) → SSS ≈ 67 ✓
+#
+# Real data run (n=14,711, June 2026):
+#   Critical  ≥ 65:   811 segments  (5.5%)
+#   High Risk 52–65: 4,795 segments (32.6%)
+#   Moderate  35–52: 4,368 segments (29.7%)
+#   Acceptable 0–35: 4,737 segments (32.2%)
+#
+# NOTE on discrete clusters: SSS has a large cluster at ~63.96 (rounds to
+# 64.0, 16.8% of segments) from roads sharing the same road-class × land-use
+# Safe System threshold. The Critical cutoff (65) sits just above this cluster,
+# so it cleanly captures only the genuinely extreme tail.
+#
+# HONESTY NOTE: bands are anchored to what the SCORE means (sub-score physics),
+# NOT validated against crash/fatality outcomes — no outcome data exists for
+# this dataset. "Critical" means the limit is severely misaligned with Safe
+# System standards; it does not claim crashes have occurred here.
 SCORE_BANDS = {
-    "Critical":   (52, 100),
-    "High Risk":  (40,  52),
-    "Moderate":   (27,  40),
-    "Acceptable": ( 0,  27),
+    "Critical":   (65, 100),
+    "High Risk":  (52,  65),
+    "Moderate":   (35,  52),
+    "Acceptable": ( 0,  35),
 }
 
 BAND_COLORS = {
@@ -421,18 +456,19 @@ ROAD_INFRA_MATCH_DIST_M = 30
 # score due to a data artifact rather than a real "this road is fine" signal.
 PRIORITY_INDEX_FLOOR = 1.0
 
-# PROVISIONAL — Priority Index bands. The geometric mean reshapes the score
-# distribution differently than SSS's additive SCORE_BANDS above, so do NOT
-# reuse those thresholds as-is. These are a first guess for the demo
-# distribution; after a real (non-demo) run, call
-# priority_scoring.suggest_priority_bands(scores) to get percentile-based
-# thresholds from actual data and update below — the same recalibration
-# process used for SCORE_BANDS in v2.1 (see changelog at top of file).
+# CALIBRATED v3.2 (June 2026) via priority_scoring.suggest_priority_bands()
+# on real data run (n=14,711): mean=40.9, std=12.3, 25th=31.4, 50th=40.0,
+# 75th=49.0, 90th=57.4. Target ~10/20/30/40% split. No discrete-cluster
+# issue (Priority Index is a continuous geometric mean across three layers).
+#   Critical  >= 57.4 → 10.0% (1,472 segments)
+#   High Risk >= 46.7 → 30.0% cumulative → 20.0% in band
+#   Moderate  >= 36.6 → 60.0% cumulative → 30.0% in band
+#   Acceptable  0–36.6 → 40.0% in band
 # Colors are intentionally shared with BAND_COLORS above (same band names,
-# same red→green risk semantics) so both metrics read consistently on the map.
+# same red->green risk semantics) so both metrics read consistently on the map.
 PRIORITY_BANDS = {
-    "Critical":   (55, 100),
-    "High Risk":  (40,  55),
-    "Moderate":   (25,  40),
-    "Acceptable": ( 0,  25),
+    "Critical":   (57, 100),
+    "High Risk":  (47,  57),
+    "Moderate":   (37,  47),
+    "Acceptable": ( 0,  37),
 }
