@@ -1,19 +1,45 @@
 """
 policy_brief.py — Ministry-ready Excel workbook export for the Speed Safety Score pipeline.
 
-Exports all Critical and High Risk segments across 6 sheets:
+Exports all Critical and High Risk segments across 8 sheets:
   1. Executive Summary
   2. Critical Segments
   3. High Risk Segments
   4. Summary by Road Class
-  5. Intervention Zones (corridors)
-  6. Methodology Note
+  5. Thailand — Province Risk Summary
+  6. Maharashtra — District Risk Summary  (spatial join with OSM admin boundaries)
+  7. Intervention Zones (corridors)
+  8. Methodology Note
 """
 
 import numpy as np
 import pandas as pd
 import geopandas as gpd
 from pathlib import Path
+
+THAILAND_PROVINCES = {
+    10: "Bangkok", 11: "Samut Prakan", 12: "Nonthaburi", 13: "Pathum Thani",
+    14: "Phra Nakhon Si Ayutthaya", 15: "Ang Thong", 16: "Lop Buri",
+    17: "Sing Buri", 18: "Chai Nat", 19: "Saraburi", 20: "Chon Buri",
+    21: "Rayong", 22: "Chanthaburi", 23: "Trat", 24: "Chachoengsao",
+    25: "Prachin Buri", 26: "Nakhon Nayok", 27: "Sa Kaeo",
+    30: "Nakhon Ratchasima", 31: "Buri Ram", 32: "Surin", 33: "Si Sa Ket",
+    34: "Ubon Ratchathani", 35: "Yasothon", 36: "Chaiyaphum",
+    37: "Amnat Charoen", 38: "Bueng Kan", 39: "Nong Bua Lam Phu",
+    40: "Khon Kaen", 41: "Udon Thani", 42: "Loei", 43: "Nong Khai",
+    44: "Maha Sarakham", 45: "Roi Et", 46: "Kalasin", 47: "Sakon Nakhon",
+    48: "Nakhon Phanom", 49: "Mukdahan", 50: "Chiang Mai", 51: "Lamphun",
+    52: "Lampang", 53: "Uttaradit", 54: "Phrae", 55: "Nan", 56: "Phayao",
+    57: "Chiang Rai", 58: "Mae Hong Son", 60: "Nakhon Sawan",
+    61: "Uthai Thani", 62: "Kamphaeng Phet", 63: "Tak", 64: "Sukhothai",
+    65: "Phitsanulok", 66: "Phichit", 67: "Phetchabun", 70: "Ratchaburi",
+    71: "Kanchanaburi", 72: "Suphan Buri", 73: "Nakhon Pathom",
+    74: "Samut Sakhon", 75: "Samut Songkhram", 76: "Phetchaburi",
+    77: "Prachuap Khiri Khan", 80: "Nakhon Si Thammarat", 81: "Krabi",
+    82: "Phangnga", 83: "Phuket", 84: "Surat Thani", 85: "Ranong",
+    86: "Chumphon", 90: "Songkhla", 91: "Satun", 92: "Trang",
+    93: "Phatthalung", 94: "Pattani", 95: "Yala", 96: "Narathiwat",
+}
 
 
 def _infer_jurisdiction(road_class: str, country: str) -> str:
@@ -133,6 +159,94 @@ def _build_segment_row(r, rank: int) -> dict:
     }
 
 
+def _build_admin_summary(gdf: gpd.GeoDataFrame) -> tuple:
+    """
+    Returns (th_df, mh_df):
+      th_df — Thailand segments aggregated by province (province_id lookup)
+      mh_df — Maharashtra segments spatially joined to OSM district boundaries
+    Both DataFrames contain: admin unit, segment count, avg SSS, Critical/High Risk counts,
+    top road class, responsible authority hint.
+    """
+    band_col = "sss_band" if "sss_band" in gdf.columns else "priority_band"
+    country_col = "country" if "country" in gdf.columns else "country_code"
+
+    def _summarise(grp_df, name_col, authority_hint):
+        rows = []
+        for unit, g in grp_df.groupby(name_col):
+            n      = len(g)
+            avg_ss = g["sss"].mean() if "sss" in g.columns else np.nan
+            n_crit = (g[band_col] == "Critical").sum()   if band_col in g.columns else 0
+            n_high = (g[band_col] == "High Risk").sum()  if band_col in g.columns else 0
+            n_prio = n_crit + n_high
+            rc_col = "road_class_norm" if "road_class_norm" in g.columns else "road_class"
+            top_rc = g[rc_col].mode()[0] if rc_col in g.columns and len(g) else ""
+            rows.append({
+                name_col:                    unit,
+                "Total Segments":            n,
+                "Critical":                  int(n_crit),
+                "High Risk":                 int(n_high),
+                "Priority Segments":         int(n_prio),
+                "% Priority":                f"{100*n_prio/n:.1f}%" if n else "",
+                "Avg SSS":                   round(avg_ss, 1) if pd.notna(avg_ss) else "",
+                "Most Common Road Class":    top_rc,
+                "Responsible Authority":     authority_hint,
+            })
+        return pd.DataFrame(rows).sort_values("Avg SSS", ascending=False).reset_index(drop=True)
+
+    # ── Thailand: group by province_id ───────────────────────────────────────
+    th_df = pd.DataFrame()
+    th_mask = gdf[country_col].str.contains("Thailand", case=False, na=False)
+    th = gdf[th_mask].copy()
+    if len(th) and "province_id" in th.columns:
+        th["province_id_n"] = pd.to_numeric(th["province_id"], errors="coerce")
+        th["Province"] = th["province_id_n"].map(
+            lambda x: THAILAND_PROVINCES.get(int(x), f"Province {int(x)}")
+            if pd.notna(x) else "Unknown"
+        )
+        th_df = _summarise(th, "Province", "DOH / DRR — Department of Highways or Rural Roads")
+        th_df.insert(1, "Province ID", th.groupby("Province")["province_id_n"].first().reindex(th_df["Province"]).values)
+        th_df.insert(2, "Region", th_df["Province"].map({
+            **{p: "Central"  for p in ["Bangkok","Nonthaburi","Pathum Thani","Samut Prakan","Samut Sakhon","Samut Songkhram","Nakhon Pathom","Suphan Buri","Ratchaburi","Kanchanaburi","Phetchaburi","Prachuap Khiri Khan","Chai Nat","Lop Buri","Sing Buri","Ang Thong","Phra Nakhon Si Ayutthaya","Saraburi","Nakhon Nayok","Chachoengsao","Prachin Buri","Sa Kaeo","Uthai Thani","Kamphaeng Phet"]},
+            **{p: "North"    for p in ["Chiang Mai","Chiang Rai","Lamphun","Lampang","Phrae","Nan","Phayao","Mae Hong Son","Uttaradit","Tak","Sukhothai","Phitsanulok","Phichit","Phetchabun","Nakhon Sawan"]},
+            **{p: "Northeast" for p in ["Nakhon Ratchasima","Buri Ram","Surin","Si Sa Ket","Ubon Ratchathani","Yasothon","Chaiyaphum","Amnat Charoen","Bueng Kan","Nong Bua Lam Phu","Khon Kaen","Udon Thani","Loei","Nong Khai","Maha Sarakham","Roi Et","Kalasin","Sakon Nakhon","Nakhon Phanom","Mukdahan"]},
+            **{p: "East"     for p in ["Chon Buri","Rayong","Chanthaburi","Trat"]},
+            **{p: "South"    for p in ["Nakhon Si Thammarat","Krabi","Phangnga","Phuket","Surat Thani","Ranong","Chumphon","Songkhla","Satun","Trang","Phatthalung","Pattani","Yala","Narathiwat"]},
+        }).fillna("Central"))
+
+    # ── Maharashtra: spatial join with OSM district boundaries ────────────────
+    mh_df = pd.DataFrame()
+    mh_mask = gdf[country_col].str.contains("Maharashtra", case=False, na=False)
+    mh = gdf[mh_mask].copy()
+
+    dist_path = Path(__file__).parent / "enrichment_data" / "admin" / "maharashtra_districts.geojson"
+    if len(mh) and dist_path.exists():
+        try:
+            districts = gpd.read_file(str(dist_path)).to_crs("EPSG:4326")
+            # Clean district names
+            districts["district_name"] = (
+                districts["district_name"]
+                .str.replace(r"\s+District$", "", regex=True)
+                .str.replace(r"\s+Taluka$", "", regex=True)
+                .str.strip()
+            )
+            # Use centroids for the join (faster, avoids geometry complexity)
+            mh_pts = mh.copy()
+            mh_pts["geometry"] = mh_pts.geometry.centroid
+            rc_col_mh = "road_class_norm" if "road_class_norm" in mh_pts.columns else "road_class"
+            join_cols = [c for c in ["segment_id", "sss", band_col, rc_col_mh] if c in mh_pts.columns]
+            join_cols.append("geometry")
+            joined = gpd.sjoin(mh_pts[join_cols],
+                               districts[["district_name","geometry"]],
+                               how="left", predicate="within")
+            joined["district_name"] = joined["district_name"].fillna("Unassigned")
+            mh_df = _summarise(joined, "district_name", "Maharashtra PWD / District Authority")
+            mh_df = mh_df.rename(columns={"district_name": "District"})
+        except Exception as e:
+            print(f"  District spatial join skipped: {e}")
+
+    return th_df, mh_df
+
+
 def export_policy_brief(
     gdf: gpd.GeoDataFrame,
     corridors: gpd.GeoDataFrame,
@@ -178,6 +292,13 @@ def export_policy_brief(
 
         crit_df = build_rows(critical_df_raw, rank_start=1)
         high_df = build_rows(highrisk_df_raw, rank_start=len(crit_df) + 1)
+
+        # ── Sheets 5–6: Admin summaries (needed for summary row counts) ───────
+        th_admin_df, mh_admin_df = pd.DataFrame(), pd.DataFrame()
+        try:
+            th_admin_df, mh_admin_df = _build_admin_summary(scored)
+        except Exception as _e:
+            print(f"  Admin summary skipped: {type(_e).__name__}: {_e}")
 
         # ── Sheet 1: Executive Summary ────────────────────────────────────────
         total  = len(scored)
@@ -226,10 +347,12 @@ def export_policy_brief(
                                   jur_example))
         summary_rows.append(("", "", "", "", ""))
         summary_rows.append(("SHEETS IN THIS WORKBOOK", "", "", "", ""))
-        summary_rows.append(("Critical Segments",    f"{len(crit_df)} rows", "Immediate action required", "", "Sorted by Priority Index"))
-        summary_rows.append(("High Risk Segments",   f"{len(high_df)} rows", "Plan within 12 months",     "", "Sorted by Priority Index"))
-        summary_rows.append(("Summary by Road Class","Aggregated",           "Country x road class view", "", ""))
-        summary_rows.append(("Methodology Note",     "Reference",            "Column definitions",        "", ""))
+        summary_rows.append(("Critical Segments",         f"{len(crit_df)} rows", "Immediate action required", "", "Sorted by Priority Index"))
+        summary_rows.append(("High Risk Segments",        f"{len(high_df)} rows", "Plan within 12 months",     "", "Sorted by Priority Index"))
+        summary_rows.append(("Summary by Road Class",     "Aggregated",           "Country x road class view", "", ""))
+        summary_rows.append(("Thailand — By Province",   f"{len(th_admin_df)} provinces", "Risk by province", "", "DOPA province codes"))
+        summary_rows.append(("Maharashtra — By District",f"{len(mh_admin_df)} districts", "Risk by OSM district", "", "Spatial join admin_level=5"))
+        summary_rows.append(("Methodology Note",          "Reference",            "Column definitions",        "", ""))
         summary_rows.append(("", "", "", "", ""))
         summary_rows.append(("NOTE: All figures are estimates based on ADB-provided sample data. "
                               "Validate against official crash records before policy action.", "", "", "", ""))
@@ -265,7 +388,7 @@ def export_policy_brief(
             })
         rc_summary_df = pd.DataFrame(rc_rows)
 
-        # ── Sheet 5: Corridors ────────────────────────────────────────────────
+        # ── Sheet 7: Corridors ────────────────────────────────────────────────
         corr_df = None
         if corridors is not None and len(corridors) > 0:
             keep = [c for c in ["priority_rank", "corridor_label", "country_code",
@@ -380,6 +503,20 @@ def export_policy_brief(
             ws = writer.sheets["Summary by Road Class"]
             style_header_row(ws, len(rc_summary_df.columns))
             autofit(ws, rc_summary_df)
+
+            if len(th_admin_df):
+                th_admin_df.to_excel(writer, sheet_name="Thailand — By Province", index=False)
+                ws = writer.sheets["Thailand — By Province"]
+                style_header_row(ws, len(th_admin_df.columns))
+                autofit(ws, th_admin_df)
+                freeze_and_filter(ws)
+
+            if len(mh_admin_df):
+                mh_admin_df.to_excel(writer, sheet_name="Maharashtra — By District", index=False)
+                ws = writer.sheets["Maharashtra — By District"]
+                style_header_row(ws, len(mh_admin_df.columns))
+                autofit(ws, mh_admin_df)
+                freeze_and_filter(ws)
 
             if corr_df is not None:
                 corr_df.to_excel(writer, sheet_name="Intervention Zones", index=False)

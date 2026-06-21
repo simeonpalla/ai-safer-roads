@@ -944,3 +944,264 @@ def export_corridors(corridors: gpd.GeoDataFrame, output_dir: str = "outputs") -
     csv_cols = [c for c in corridors.columns if c != "geometry"]
     corridors[csv_cols].to_csv(f"{output_dir}/speed_safety_corridors.csv", index=False)
     print(f"Intervention zones exported: {output_dir}/speed_safety_corridors.gpkg ({len(corridors)} zones)")
+
+
+def plot_sss_vs_pct_over_limit(
+    gdf: gpd.GeoDataFrame,
+    output_dir: str = "outputs",
+) -> str:
+    """
+    Scatter plot: Speed Safety Score (Y) vs % vehicles over limit (X).
+    Divides into 4 quadrants; Q1 'Hidden Danger' is the key finding —
+    roads that are dangerous despite driver compliance.
+    Saves to <output_dir>/scatter_sss_vs_pct_over_limit.png.
+    Returns the output path.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+
+    df = gdf.copy()
+    df = df.dropna(subset=["sss", "pct_over_limit"])
+    df = df[(df["sss"] >= 0) & (df["sss"] <= 100)]
+    if df["pct_over_limit"].max() <= 1.0:
+        df["pct_over_limit"] = df["pct_over_limit"] * 100
+    df = df[(df["pct_over_limit"] >= 0) & (df["pct_over_limit"] <= 100)]
+
+    if len(df) < 10:
+        print("  Scatter plot skipped — insufficient data with both sss and pct_over_limit")
+        return ""
+
+    SSS_THRESH, PCT_THRESH = 45, 40
+    q1 = df[(df["sss"] >= SSS_THRESH) & (df["pct_over_limit"] <  PCT_THRESH)]
+    q2 = df[(df["sss"] >= SSS_THRESH) & (df["pct_over_limit"] >= PCT_THRESH)]
+    q3 = df[(df["sss"] <  SSS_THRESH) & (df["pct_over_limit"] <  PCT_THRESH)]
+    q4 = df[(df["sss"] <  SSS_THRESH) & (df["pct_over_limit"] >= PCT_THRESH)]
+    total_danger = len(q1) + len(q2)
+    pct_missed   = 100 * len(q1) / total_danger if total_danger > 0 else 0
+
+    BAND_COLOR = {
+        "Critical":   "#D32F2F",
+        "High Risk":  "#F57C00",
+        "Moderate":   "#F9A825",
+        "Acceptable": "#388E3C",
+    }
+    BAND_ORDER = ["Critical", "High Risk", "Moderate", "Acceptable"]
+
+    fig, ax = plt.subplots(figsize=(11.4, 5.1))
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("#F8F9FA")
+
+    for band in BAND_ORDER:
+        sub = df[df.get("sss_band", pd.Series(dtype=str)) == band] if "sss_band" in df.columns else df
+        if "sss_band" not in df.columns:
+            sub = df
+        ax.scatter(sub["pct_over_limit"], sub["sss"],
+                   c=BAND_COLOR.get(band, "#888"), s=9, alpha=0.28,
+                   linewidths=0, label=band, zorder=2, rasterized=True)
+
+    ax.axhspan(SSS_THRESH, 100, xmin=0,              xmax=PCT_THRESH/100, alpha=0.06, color="#C62828", zorder=1)
+    ax.axhspan(SSS_THRESH, 100, xmin=PCT_THRESH/100, xmax=1,             alpha=0.04, color="#6A1B9A", zorder=1)
+    ax.axhspan(0, SSS_THRESH,   xmin=0,              xmax=PCT_THRESH/100, alpha=0.04, color="#1B5E20", zorder=1)
+    ax.axhspan(0, SSS_THRESH,   xmin=PCT_THRESH/100, xmax=1,             alpha=0.04, color="#E65100", zorder=1)
+
+    ax.axvline(PCT_THRESH, color="#888", lw=1.3, ls="--", zorder=3, alpha=0.75)
+    ax.axhline(SSS_THRESH, color="#888", lw=1.3, ls="--", zorder=3, alpha=0.75)
+
+    QL = dict(fontsize=11, fontweight="bold", va="center", ha="center", zorder=5,
+              bbox=dict(boxstyle="round,pad=0.28", fc="white", ec="none", alpha=0.82))
+    ax.text(PCT_THRESH / 2,         (SSS_THRESH + 100) / 2,
+            f"Hidden Danger\n{len(q1):,} roads",    color="#C62828", **QL)
+    ax.text((PCT_THRESH + 100) / 2, (SSS_THRESH + 100) / 2,
+            f"Confirmed Danger\n{len(q2):,} roads", color="#6A1B9A", **QL)
+    ax.text(PCT_THRESH / 2,         SSS_THRESH / 2,
+            f"Safe\n{len(q3):,} roads",             color="#1B5E20", **QL)
+    ax.text((PCT_THRESH + 100) / 2, SSS_THRESH / 2,
+            f"False Alarm\n{len(q4):,} roads",      color="#BF360C", **QL)
+
+    ax.text(98, 97,
+            f"{pct_missed:.0f}% of high-risk roads\ninvisible to speed-camera monitoring",
+            ha="right", va="top", fontsize=9, fontweight="bold", color="white", zorder=6,
+            bbox=dict(boxstyle="round,pad=0.45", fc="#002569", ec="none", alpha=0.93))
+
+    ax.set_xlabel("% Vehicles Exceeding Posted Limit", fontsize=11, color="#333", labelpad=5)
+    ax.set_ylabel("Speed Safety Score (0–100)",         fontsize=11, color="#333", labelpad=5)
+    ax.set_xlim(0, 100)
+    ax.set_ylim(0, 100)
+    ax.tick_params(colors="#555", labelsize=9)
+    for spine in ax.spines.values():
+        spine.set_color("#CCC")
+    ax.text(PCT_THRESH + 1, 1.5, f"{PCT_THRESH}% threshold",
+            fontsize=7.5, color="#777", style="italic")
+    ax.text(1, SSS_THRESH + 1.5, f"SSS {SSS_THRESH}",
+            fontsize=7.5, color="#777", style="italic")
+
+    if "sss_band" in df.columns:
+        handles = [mpatches.Patch(color=BAND_COLOR[b],
+                                   label=f"{b}  (n={len(df[df['sss_band']==b]):,})")
+                   for b in BAND_ORDER if b in df["sss_band"].values]
+        ax.legend(handles=handles, title="SSS Band", title_fontsize=8,
+                  fontsize=8, loc="lower right", framealpha=0.92, edgecolor="#CCC")
+
+    fig.suptitle("Speed Safety Score vs. Driver Compliance",
+                 fontsize=14, fontweight="bold", color="#002569", y=1.01)
+    plt.tight_layout(pad=0.6)
+
+    out = str(Path(output_dir) / "scatter_sss_vs_pct_over_limit.png")
+    fig.savefig(out, dpi=150, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+    print(f"  Scatter saved: scatter_sss_vs_pct_over_limit.png")
+    print(f"  Q1 Hidden Danger: {len(q1):,} roads ({100*len(q1)/len(df):.1f}%)")
+    print(f"  Conventional monitoring misses {pct_missed:.0f}% of high-risk roads")
+    return out
+
+
+def plot_shap_importance(
+    gdf: gpd.GeoDataFrame,
+    output_dir: str = "outputs",
+) -> str:
+    """
+    Retrain XGBoost on Tier-2 scored segments, compute SHAP values,
+    and plot a top-10 mean |SHAP| horizontal bar chart.
+    Saves to <output_dir>/ml_shap_importance.png.
+    Returns the output path.
+    """
+    try:
+        import xgboost as xgb
+        import shap as shap_lib
+    except ImportError:
+        print("  SHAP chart skipped — pip install xgboost shap")
+        return ""
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    import warnings
+    warnings.filterwarnings("ignore")
+
+    NUMERIC = [
+        "speed_limit", "ss_limit", "credibility_gap", "nilsson_fatal_ratio",
+        "exposure_score", "pop_density_500m", "dist_to_school_m", "dist_to_hospital_m",
+    ]
+    CAT = ["road_class_norm", "road_class", "land_use"]
+    DISPLAY = {
+        "speed_limit":         "Posted Speed Limit",
+        "ss_limit":            "Safe System Speed Limit",
+        "credibility_gap":     "Limit Credibility Gap",
+        "nilsson_fatal_ratio": "Nilsson Fatal Risk Ratio",
+        "exposure_score":      "Exposure Score",
+        "pop_density_500m":    "Population Density (500m)",
+        "dist_to_school_m":    "Distance to School",
+        "dist_to_hospital_m":  "Distance to Hospital",
+    }
+
+    train = gdf[gdf["sss"].notna()].copy()
+    if len(train) < 50:
+        print("  SHAP chart skipped — fewer than 50 scored segments")
+        return ""
+
+    num_feats = [f for f in NUMERIC if f in train.columns]
+    cat_feats  = next((f for f in CAT if f in train.columns), None)
+    cat_list   = [cat_feats] if cat_feats else []
+
+    num_df = train.reindex(columns=num_feats).astype(float)
+    cat_df = pd.get_dummies(
+        train.reindex(columns=cat_list).fillna("unknown"),
+        prefix=cat_list, dtype=float,
+    ) if cat_list else pd.DataFrame(index=train.index)
+
+    X = pd.concat([num_df, cat_df], axis=1)
+    y = train["sss"].values.astype(float)
+
+    model = xgb.XGBRegressor(
+        n_estimators=300, max_depth=5, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8, min_child_weight=5,
+        random_state=42, n_jobs=-1, verbosity=0,
+    )
+    model.fit(X, y)
+
+    print(f"  Computing SHAP values ({len(X):,} segments)...")
+    explainer  = shap_lib.TreeExplainer(model)
+    sv         = np.abs(explainer(X).values)
+    mean_shap  = sv.mean(axis=0)
+
+    def clean_name(f):
+        if f in DISPLAY:
+            return DISPLAY[f]
+        for pref in cat_list:
+            if f.startswith(pref + "_"):
+                val = f[len(pref)+1:].replace("_", " ").title()
+                label = "Road Class" if "road" in pref else "Land Use"
+                return f"{label}: {val}"
+        return f.replace("_", " ").title()
+
+    feat_names = list(X.columns)
+    shap_df = (
+        pd.DataFrame({"feature": feat_names, "mean_shap": mean_shap})
+        .sort_values("mean_shap", ascending=False)
+        .head(10)
+    )
+    shap_df["label"] = shap_df["feature"].apply(clean_name)
+    top10 = shap_df.iloc[::-1]
+
+    def bar_color(label):
+        if "Speed" in label or "Credibility" in label:
+            return "#F57C00"
+        if "Nilsson" in label or "Exposure" in label:
+            return "#D32F2F"
+        if "Population" in label or "School" in label or "Hospital" in label:
+            return "#1565C0"
+        return "#558B2F"
+
+    fig, ax = plt.subplots(figsize=(10.5, 5.0))
+    fig.patch.set_facecolor("white")
+    ax.set_facecolor("#F8F9FA")
+
+    colors = [bar_color(l) for l in top10["label"]]
+    bars = ax.barh(top10["label"], top10["mean_shap"],
+                   color=colors, height=0.62, edgecolor="white", linewidth=0.5)
+    for bar, val in zip(bars, top10["mean_shap"]):
+        ax.text(val + 0.02, bar.get_y() + bar.get_height() / 2,
+                f"{val:.2f}", va="center", fontsize=9, color="#333")
+
+    median_val = float(top10["mean_shap"].median())
+    ax.axvline(median_val, color="#AAA", lw=1, ls=":", zorder=0)
+    ax.text(median_val + 0.02, -0.7, "median",
+            fontsize=7.5, color="#AAA", style="italic", va="bottom")
+
+    ax.set_xlabel("Mean |SHAP Value| — Average Impact on SSS Prediction",
+                  fontsize=10.5, color="#333", labelpad=6)
+    ax.set_xlim(0, float(top10["mean_shap"].max()) * 1.18)
+    ax.tick_params(axis="y", labelsize=10, colors="#333")
+    ax.tick_params(axis="x", labelsize=9,  colors="#555")
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+    ax.spines["left"].set_color("#DDD")
+    ax.spines["bottom"].set_color("#DDD")
+    ax.set_axisbelow(True)
+    ax.xaxis.grid(True, color="#EEE", linewidth=0.8)
+
+    legend_items = [
+        mpatches.Patch(color="#F57C00", label="Speed / Limit"),
+        mpatches.Patch(color="#D32F2F", label="Risk / Exposure"),
+        mpatches.Patch(color="#1565C0", label="VRU Context"),
+        mpatches.Patch(color="#558B2F", label="Road Type"),
+    ]
+    ax.legend(handles=legend_items, fontsize=8.5, loc="lower right",
+              framealpha=0.9, edgecolor="#CCC", ncol=2)
+
+    fig.suptitle("What Drives the XGBoost SSS Prediction — SHAP Feature Importance",
+                 fontsize=13, fontweight="bold", color="#002569", y=1.01)
+    plt.tight_layout(pad=0.7)
+
+    out = str(Path(output_dir) / "ml_shap_importance.png")
+    fig.savefig(out, dpi=150, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+    top1 = shap_df.iloc[0]
+    print(f"  SHAP chart saved: ml_shap_importance.png")
+    print(f"  Top driver: {top1['label']} (mean |SHAP| = {top1['mean_shap']:.2f})")
+    return out

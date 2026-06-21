@@ -169,6 +169,21 @@ A road where only 20% of drivers exceed the limit can still be Critical if the l
 
 Our SSS captures both failure modes. `PercentOverLimit` captures neither cleanly.
 
+### Empirical Proof — The Hidden Danger Finding
+
+We tested this directly on the 14,711 Tier 2 segments by plotting SSS against % vehicles over limit and dividing the space into four quadrants (SSS threshold: 45, % over limit threshold: 40%):
+
+| Quadrant | Definition | Count | Share |
+|---|---|---|---|
+| **Hidden Danger** | SSS ≥ 45, % over limit < 40% | **5,021** | **34.1%** |
+| Confirmed Danger | SSS ≥ 45, % over limit ≥ 40% | 1,822 | 12.4% |
+| Safe | SSS < 45, % over limit < 40% | 5,907 | 40.2% |
+| False Alarm | SSS < 45, % over limit ≥ 40% | 1,961 | 13.3% |
+
+**Key finding:** Of all 6,843 high-risk segments (SSS ≥ 45), **73% fall in the Hidden Danger quadrant** — they would be deprioritised or missed entirely by any monitoring system that ranks roads by driver non-compliance. Drivers on these roads are largely compliant with a limit that is itself set wrong.
+
+This is the core empirical validation of the methodology: SSS and PercentOverLimit are measuring different things, and the difference has operational consequences.
+
 ### Overall Architecture
 
 ```mermaid
@@ -402,6 +417,30 @@ graph TD
     G --> I["Predict SSS for 45,183 unscored segments"]
 ```
 
+### SHAP Feature Importance — What the Model Actually Learned
+
+After training, we ran SHAP (SHapley Additive exPlanations) on the full training set to extract the mean absolute impact of each feature on the SSS prediction. This answers the question: *did the model learn the right physics, or did it fit noise?*
+
+| Rank | Feature | Mean \|SHAP\| | Category |
+|---|---|---|---|
+| 1 | Land Use: Rural | 6.91 | Road context |
+| 2 | Limit Credibility Gap | 4.85 | Speed / limit |
+| 3 | Posted Speed Limit | 4.33 | Speed / limit |
+| 4 | Safe System Speed Limit | 4.14 | Speed / limit |
+| 5 | Nilsson Fatal Risk Ratio | 3.92 | Risk / severity |
+| 6 | Road Class: Secondary | 0.93 | Road type |
+| 7 | Land Use: Urban | 0.89 | Road context |
+| 8–10 | Road Class: Trunk / Primary / Motorway | < 0.32 | Road type |
+
+**What this tells us:**
+
+- **Rural land use is the single largest driver.** Rural roads have the widest gap between typical posted limits and Safe System thresholds — the model learned this from data, not from a hand-coded rule.
+- **Limit Credibility Gap is #2.** The model independently confirms our engineering judgment that the gap between observed behaviour and the posted limit is the second most important predictor. This validates Sub-score 2's 30% weight.
+- **Nilsson Fatal Risk Ratio at #5** confirms the severity component is being captured. The model learned that roads where a given speed produces a disproportionate fatality risk score higher — again, without being told to.
+- **Population density and facility proximity do not appear in the top 10.** This reflects that the model was trained on the same features that feed Sub-score 3 (VRU Context Risk), and those features have lower variance than speed-related inputs. It does not mean VRU exposure is unimportant — it means the model's predictive power for SSS comes primarily from the speed alignment gap, while VRU context modulates the score at the margin.
+
+The SHAP results confirm the model learned a defensible representation of road danger, not a spurious statistical artefact.
+
 ### Interpreting the Validation Metrics
 
 **RMSE = 8.0** on a 0–100 scale means the model's predictions are, on average, 8 points away from the true score. To contextualise: the score band boundaries are 13 points apart (Critical ≥65, High Risk ≥52). An 8-point average error means the model will occasionally misclassify a segment near a band boundary — a High Risk segment at 53 might be predicted as Moderate at 45. However, it will rarely confuse Critical with Acceptable.
@@ -518,6 +557,8 @@ graph TD
 | `speed_safety_map.html` | Leaflet HTML | Interactive map with all layers, Street View links, toggles |
 | `ml_validation_scatter.png` | PNG | XGBoost OOF scatter: predicted vs actual SSS |
 | `score_overview.png` | PNG | Band distribution summary chart |
+| `ml_shap_importance.png` | PNG | SHAP feature importance bar chart (top 10 features by mean \|SHAP\|) |
+| `scatter_sss_vs_pct_over_limit.png` | PNG | SSS vs % over limit scatter — 4-quadrant Hidden Danger analysis |
 
 ### Policy Brief Structure
 
@@ -562,7 +603,10 @@ This tells a field engineer exactly which government body owns the road and is r
 | VIIRS high-NTL hotspots | 5,487 (7.8%) |
 | Priority segments in policy brief | 6,008 |
 | XGBoost RMSE / R² | 8.0 / 0.817 |
+| SHAP top driver | Land Use: Rural (mean \|SHAP\| = 6.91) |
 | Weight sensitivity (Spearman r) | ≥ 0.95 |
+| Hidden Danger segments (SSS ≥ 45, % over limit < 40%) | 5,021 (34.1% of Tier 2) |
+| High-risk roads missed by % over limit monitoring | 73% |
 
 ### The Finding That Matters Most
 

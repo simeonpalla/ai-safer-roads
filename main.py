@@ -38,7 +38,8 @@ from enrichment import enrich_segments
 from priority_scoring import run_priority_scoring
 from ml_extension     import run_ml_extension
 from evaluation       import run_full_evaluation, plot_score_overview
-from visualization    import build_interactive_map, export_for_esri, export_corridors
+from visualization    import build_interactive_map, export_for_esri, export_corridors, \
+                             plot_sss_vs_pct_over_limit, plot_shap_importance
 from policy_brief     import export_policy_brief
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -396,6 +397,9 @@ def main():
 
     if corridors is not None and len(corridors):
         export_corridors(corridors, output_dir=args.out)
+
+    plot_sss_vs_pct_over_limit(combined, output_dir=args.out)
+    plot_shap_importance(combined, output_dir=args.out)
 
     export_policy_brief(combined, corridors, output_dir=args.out)
 
