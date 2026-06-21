@@ -58,6 +58,7 @@ from config import (
     HELMET_SPI, HELMET_SEVERITY_WEIGHT,
     VRU_RC_SCORE_MAP,
 )
+from geometry_features import sinuosity_ss_adjustment
 
 # Weights — compliance removed, weight redistributed
 WEIGHTS = {
@@ -68,18 +69,21 @@ WEIGHTS = {
 
 
 def get_safe_system_limit(road_class_norm: str, land_use: str,
-                           osm_oneway: str = None, osm_lanes: float = None) -> float:
+                           osm_oneway: str = None, osm_lanes: float = None,
+                           sinuosity: float = 1.0) -> float:
     """
     Safe System speed ceiling for this road.
 
-    OSM-EVIDENCE OVERRIDE (new): if enrichment.match_road_infrastructure()
-    found a real OSM way tag confirming physical separation (oneway=yes,
-    or 4+ lanes suggesting a dual carriageway), the road's crash-type
-    context shifts toward "fully separated" (the real WHO 100 km/h tier)
-    regardless of the road-class assumption — head-on collisions aren't
-    possible on a genuinely separated carriageway. This replaces an
-    ASSUMPTION (road class implies divided/undivided) with an OBSERVED
-    fact where one is available, falling back to the assumption otherwise.
+    OSM-EVIDENCE OVERRIDE: if enrichment found a real OSM tag confirming
+    physical separation (oneway=yes or 4+ lanes), the road's crash-type
+    context shifts toward "fully separated" (WHO 100 km/h tier) —
+    replacing an assumption with an observed fact.
+
+    GEOMETRY ADJUSTMENT (new): sinuous alignments restrict sight distance and
+    reaction time, lowering the speed at which a crash is survivable.
+    Grounded in AASHTO Green Book Table 3-6 (design speed vs curvature) and
+    iRAP star-rating methodology (sinuosity as explicit risk attribute).
+    Adjustment is strictly downward; floor is 30 km/h (WHO VRU-mixing tier).
     """
     key = (
         road_class_norm.lower() if pd.notna(road_class_norm) else "unknown",
@@ -91,31 +95,40 @@ def get_safe_system_limit(road_class_norm: str, land_use: str,
         fallback = ("unknown", key[1])
         base = float(SAFE_SYSTEM_THRESHOLDS.get(fallback, SAFE_SYSTEM_THRESHOLDS[("unknown", "unknown")]))
 
-    # OSM-confirmed physical separation → no head-on risk → allow up to the
-    # "fully separated" tier (100), but never LOWER than the road-class
-    # assumption already gave (this is a one-directional safety-relevant
-    # upgrade, not a general re-assignment).
+    # OSM-confirmed physical separation → no head-on risk
     is_divided_confirmed = (
         (pd.notna(osm_oneway) and str(osm_oneway).lower() == "yes") or
         (pd.notna(osm_lanes) and osm_lanes >= 4)
     )
     if is_divided_confirmed and key[0] != "motorway":
         base = max(base, 100.0) if key[1] == "rural" else max(base, 80.0)
+
+    # Geometry adjustment — curved roads require lower design speed
+    reduction = sinuosity_ss_adjustment(sinuosity if pd.notna(sinuosity) else 1.0)
+    if reduction > 0:
+        base = max(base - reduction, 30.0)
+
     return base
 
 
 def add_safe_system_limits(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     gdf = gdf.copy()
     has_osm = "osm_oneway" in gdf.columns or "osm_lanes" in gdf.columns
+    has_sinuosity = "sinuosity" in gdf.columns
     gdf["ss_limit"] = gdf.apply(
         lambda r: get_safe_system_limit(
             r.get("road_class_norm", "unknown"),
             r.get("land_use", "unknown"),
-            r.get("osm_oneway") if has_osm else None,
-            r.get("osm_lanes")  if has_osm else None,
+            r.get("osm_oneway")  if has_osm      else None,
+            r.get("osm_lanes")   if has_osm      else None,
+            r.get("sinuosity")   if has_sinuosity else 1.0,
         ),
         axis=1,
     )
+    if has_sinuosity:
+        n_adj = (gdf["sinuosity"] >= 1.20).sum()
+        if n_adj:
+            print(f"  SS limit adjusted for sinuosity on {n_adj:,} curved segments")
     return gdf
 
 

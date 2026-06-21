@@ -10,6 +10,7 @@ Usage:
 
 import argparse
 import io
+import os
 import sys
 import warnings
 from pathlib import Path
@@ -30,6 +31,7 @@ from preprocessing    import load_maharashtra, load_thailand, load_helmet_data, 
                              merge_datasets, get_analysis_subset
 from scoring          import add_safe_system_limits, compute_speed_safety_score, \
                              compute_alignment_only_score
+from geometry_features import compute_geometry_features
 from ai_scoring import run_ai_scoring
 from advanced_scoring import run_advanced_scoring
 from enrichment import enrich_segments
@@ -53,10 +55,13 @@ def parse_args():
     p.add_argument("--th",      default=DEFAULT_TH_PATH)
     p.add_argument("--helmet",  default=DEFAULT_HELMET_PATH)
     p.add_argument("--out",     default=OUTPUT_DIR)
-    p.add_argument("--no-eval", action="store_true")
-    p.add_argument("--no-map",  action="store_true")
-    p.add_argument("--no-ml",   action="store_true")
-    p.add_argument("--demo",    action="store_true")
+    p.add_argument("--no-eval",          action="store_true")
+    p.add_argument("--no-map",           action="store_true")
+    p.add_argument("--no-ml",            action="store_true")
+    p.add_argument("--no-viirs",         action="store_true")
+    p.add_argument("--mapillary-token",  default=None,
+                   help="Mapillary API token (or set MAPILLARY_TOKEN env var)")
+    p.add_argument("--demo",             action="store_true")
     return p.parse_args()
 
 
@@ -243,6 +248,194 @@ def print_policy_summary(gdf: gpd.GeoDataFrame, corridors: gpd.GeoDataFrame) -> 
     print()
 
 
+# ─── Policy brief export ─────────────────────────────────────────────────────
+
+def export_policy_brief(
+    gdf: gpd.GeoDataFrame,
+    corridors: gpd.GeoDataFrame,
+    output_dir: str,
+    top_n: int = 20,
+) -> None:
+    """
+    Export a decision-ready Excel workbook: Top-N Priority Interventions.
+
+    Sheet 1 — Top Priority Segments: one row per high-priority road segment
+      with the columns a transport ministry needs to brief engineers:
+      Road Name | Province | Road Class | Current Limit | Recommended Limit
+      | Priority Score | Why Dangerous | Sinuosity | Geometry Risk
+      | Nighttime Exposure | Mapillary Coverage
+
+    Sheet 2 — Intervention Zones: aggregated corridor-level view
+      (if corridor data available)
+
+    Sheet 3 — Methodology Note: brief description of each column for reviewers
+    """
+    import openpyxl  # noqa — just checking it's available before we build df
+
+    try:
+        out_path = Path(output_dir) / "Top_Priority_Interventions.xlsx"
+
+        # ── Sheet 1: Top segments ─────────────────────────────────────────────
+        mask = (gdf.get("scoreable", pd.Series(False, index=gdf.index)) |
+                gdf.get("alignment_scoreable", pd.Series(False, index=gdf.index)))
+        df = gdf[mask].copy()
+
+        # Sort by priority: prefer priority_index then sss
+        sort_col = "priority_index" if "priority_index" in df.columns else "sss"
+        if sort_col not in df.columns:
+            sort_col = None
+
+        if sort_col:
+            df = df.nlargest(min(top_n * 5, len(df)), sort_col)
+
+        # Build readable columns
+        rows = []
+        for _, r in df.head(top_n).iterrows():
+            speed_limit    = r.get("speed_limit", np.nan)
+            rec_limit      = r.get("recommended_limit", r.get("ss_limit", np.nan))
+            sss            = r.get("sss", np.nan)
+            speed_85th     = r.get("speed_85th", np.nan)
+            pct_over       = r.get("pct_over_limit", np.nan)
+            sinuosity      = r.get("sinuosity", np.nan)
+            ntl_score      = r.get("ntl_exposure_score", np.nan)
+            mapillary      = r.get("mapillary_covered", False)
+            priority_band  = r.get("priority_band", r.get("sss_band", ""))
+            change_effort  = r.get("change_effort", "")
+            nilsson        = r.get("nilsson_fatal_ratio", np.nan)
+            credibility    = r.get("credibility_class", "")
+            osm_lit        = str(r.get("osm_lit", "") or "")
+            osm_surface    = str(r.get("osm_surface", "") or "")
+            blindspot      = bool(r.get("mapillary_blindspot", False))
+            land_use       = str(r.get("land_use", "") or "")
+            road_class     = str(r.get("road_class_norm", r.get("road_class", "")) or "")
+
+            # Recommended intervention actions — engineering specificity beyond speed limit change
+            actions = []
+            if pd.notna(speed_limit) and pd.notna(rec_limit) and speed_limit - rec_limit > 20:
+                actions.append(f"Reduce speed limit to {rec_limit:.0f} km/h (major revision + enforcement)")
+            elif pd.notna(speed_limit) and pd.notna(rec_limit) and speed_limit > rec_limit:
+                actions.append(f"Reduce speed limit to {rec_limit:.0f} km/h")
+            if pd.notna(sinuosity) and sinuosity >= 1.5:
+                actions.append("Install curve warning chevrons and advance warning signs")
+            elif pd.notna(sinuosity) and sinuosity >= 1.2:
+                actions.append("Install curve advisory speed signs")
+            if blindspot:
+                actions.append("Deploy speed camera or automated enforcement (unmonitored segment)")
+            if osm_lit == "no" and land_use in ("urban", "interurban"):
+                actions.append("Install street lighting (confirmed unlit road in populated area)")
+            elif pd.notna(ntl_score) and ntl_score > 60 and osm_lit not in ("yes",):
+                actions.append("Assess street lighting — high nighttime pedestrian activity detected via VIIRS")
+            if osm_surface in ("unpaved", "gravel", "dirt", "compacted", "ground"):
+                actions.append("Resurface to sealed asphalt (unpaved surface — loss-of-control risk)")
+            if pd.notna(nilsson) and nilsson > 4 and road_class in ("trunk", "primary"):
+                actions.append("Install median barrier / physical separation")
+            if credibility == "Non-Credible":
+                actions.append("Redesign limit scheme — posted limit widely ignored by drivers")
+            if road_class == "residential" and pd.notna(speed_limit) and speed_limit > 30:
+                actions.append("Implement traffic calming (residential road)")
+            if not actions:
+                actions.append("Monitor and schedule audit")
+            intervention = "; ".join(actions)
+
+            # Human-readable "Why Dangerous" field
+            reasons = []
+            if pd.notna(sss) and sss >= 50:
+                reasons.append(f"SSS {sss:.0f}/100")
+            if pd.notna(speed_85th) and pd.notna(speed_limit) and speed_85th > speed_limit + 10:
+                reasons.append(f"85th-pct speed {speed_85th:.0f} > limit {speed_limit:.0f}")
+            if pd.notna(pct_over) and pct_over > 40:
+                reasons.append(f"{pct_over:.0f}% exceed limit")
+            if pd.notna(nilsson) and nilsson > 2:
+                reasons.append(f"{nilsson:.1f}x crash risk (Nilsson)")
+            if pd.notna(sinuosity) and sinuosity >= 1.20:
+                reasons.append(f"Sinuous road (SI={sinuosity:.2f})")
+            if pd.notna(ntl_score) and ntl_score > 60:
+                reasons.append(f"High nighttime exposure (NTL={ntl_score:.0f})")
+            if credibility == "Non-Credible":
+                reasons.append("Speed limit non-credible")
+            why = "; ".join(reasons) if reasons else priority_band
+
+            rows.append({
+                "Rank":                r.name if pd.notna(r.name) else "",
+                "Road Name":           r.get("road_name", r.get("segment_id", "")),
+                "Province/State":      r.get("province", r.get("district",
+                                          "Maharashtra" if r.get("country_code","") == "MH"
+                                          else "Thailand")),
+                "Country":             r.get("country_code", ""),
+                "Road Class":          r.get("road_class_norm", r.get("road_class", "")),
+                "Posted Limit (km/h)": speed_limit,
+                "Recommended Limit":   rec_limit,
+                "Change Needed (km/h)": (speed_limit - rec_limit
+                                         if pd.notna(speed_limit) and pd.notna(rec_limit) else np.nan),
+                "Speed Safety Score":  round(sss, 1) if pd.notna(sss) else "",
+                "Priority Band":       priority_band,
+                "Why Dangerous":       why,
+                "85th pct Speed":      round(speed_85th, 1) if pd.notna(speed_85th) else "",
+                "% Over Limit":        round(pct_over, 1) if pd.notna(pct_over) else "",
+                "Sinuosity Index":     round(sinuosity, 3) if pd.notna(sinuosity) else "",
+                "NTL Exposure (0-100)": round(ntl_score, 1) if pd.notna(ntl_score) else "N/A",
+                "Mapillary Covered":   "Yes" if mapillary else "No",
+                "Intervention Actions": intervention,
+                "Change Effort":       change_effort,
+                "Credibility":         credibility,
+            })
+
+        seg_df = pd.DataFrame(rows).reset_index(drop=True)
+        seg_df.insert(0, "Priority Rank", range(1, len(seg_df) + 1))
+
+        # ── Sheet 2: Corridors ────────────────────────────────────────────────
+        corr_df = None
+        if corridors is not None and len(corridors) > 0:
+            keep = [c for c in ["priority_rank", "corridor_label", "country_code",
+                                 "n_segments", "sss", "nilsson_fatal_ratio",
+                                 "est_lives_saved", "change_effort"]
+                    if c in corridors.columns]
+            corr_df = corridors[keep].head(top_n).copy()
+
+        # ── Sheet 3: Methodology note ─────────────────────────────────────────
+        method_rows = [
+            ("Speed Safety Score (SSS)", "0–100. Composite of speed gap, limit credibility, and VRU risk. Higher = more unsafe."),
+            ("Priority Band",            "Critical / High Risk / Moderate / Acceptable based on multi-factor priority index."),
+            ("Recommended Limit",        "Safe System speed limit for this road class and land-use context, geometry-adjusted for sinuous roads."),
+            ("Change Needed",            "Posted limit minus recommended limit. Positive = limit should be reduced."),
+            ("Sinuosity Index",          "Path length / crow-flies distance. 1.0 = straight. ≥1.20 → recommended limit reduced per AASHTO Green Book."),
+            ("NTL Exposure",             "Normalized VIIRS nighttime light (0–100). Proxy for informal market activity and nighttime pedestrian density."),
+            ("Mapillary Covered",        "Whether Mapillary street imagery CV features were available for this segment."),
+            ("Intervention Actions",     "Specific engineering and enforcement actions recommended based on score drivers: speed limit revision, physical separation, lighting, surface quality, curve treatments, and enforcement camera deployment. Derived from SSS sub-scores, sinuosity, Mapillary blindspot flag, NTL score, and OSM infrastructure tags."),
+            ("Nilsson Fatal Ratio",      "Estimated crash risk ratio relative to Safe System speed (Nilsson Power Model, WHO endorsed)."),
+            ("Credibility",              "Credible = drivers naturally obey; Non-Credible = 85th-pct speed far exceeds posted limit."),
+            ("Source",                   "ADB Innovation Challenge dataset. GPS speed data from ADB-provided Maharashtra and Thailand GeoJSON."),
+            ("Note",                     "All figures are illustrative estimates based on available ADB sample data. Validate against official crash records before policy action."),
+        ]
+        method_df = pd.DataFrame(method_rows, columns=["Column / Term", "Explanation"])
+
+        # ── Write workbook ────────────────────────────────────────────────────
+        with pd.ExcelWriter(str(out_path), engine="openpyxl") as writer:
+            seg_df.to_excel(writer, sheet_name="Top Priority Segments", index=False)
+            if corr_df is not None:
+                corr_df.to_excel(writer, sheet_name="Intervention Zones", index=False)
+            method_df.to_excel(writer, sheet_name="Methodology Note", index=False)
+
+            # Auto-fit column widths
+            for sheet_name, df_s in [("Top Priority Segments", seg_df),
+                                       ("Methodology Note", method_df)]:
+                ws = writer.sheets[sheet_name]
+                for col_idx, col in enumerate(df_s.columns, start=1):
+                    max_w = max(len(str(col)), df_s[col].astype(str).str.len().max())
+                    ws.column_dimensions[
+                        openpyxl.utils.get_column_letter(col_idx)
+                    ].width = min(max_w + 2, 60)
+
+        print(f"\n  Policy brief exported: {out_path.name}")
+        print(f"  Top {len(seg_df)} priority interventions across "
+              f"{seg_df['Country'].nunique()} countries")
+
+    except ImportError:
+        print("  Policy brief skipped — pip install openpyxl to enable")
+    except Exception as e:
+        print(f"  Policy brief export failed — {e}")
+
+
 # ─── Main pipeline ────────────────────────────────────────────────────────────
 
 def main():
@@ -279,13 +472,18 @@ def main():
         combined = merge_datasets(mh, th)
         combined = get_analysis_subset(combined)
 
-    # ── Step 2: Safe System limits ────────────────────────────────────────
+    # ── Step 2: Road geometry features ───────────────────────────────────
     step_label = "[2/6]" if args.demo else "[3/6]"
-    print(f"\n{step_label} Computing Safe System reference limits...")
+    print(f"\n{step_label} Extracting road geometry features...")
+    combined = compute_geometry_features(combined)
+
+    # ── Step 3: Safe System limits ────────────────────────────────────────
+    step_label = "[3/6]" if args.demo else "[4/6]"
+    print(f"\n{step_label} Computing Safe System reference limits (with geometry adjustment)...")
     combined = add_safe_system_limits(combined)
 
-    # ── Step 3: Base SSS ──────────────────────────────────────────────────
-    step_label = "[3/6]" if args.demo else "[4/6]"
+    # ── Step 4: Base SSS ──────────────────────────────────────────────────
+    step_label = "[4/6]" if args.demo else "[5/6]"
     print(f"\n{step_label} Computing Speed Safety Scores (base)...")
     combined = compute_speed_safety_score(combined)
 
@@ -325,6 +523,27 @@ def main():
     print("\n[Enrichment] Building exposure score...")
     combined = enrich_segments(combined, data_dir="enrichment_data")
 
+    # ── Satellite enrichment: VIIRS nighttime lights ──────────────────────────
+    if not args.no_viirs:
+        from viirs_features import compute_ntl_scores, apply_ntl_to_scoring
+        print("\n[Satellite] VIIRS nighttime lights enrichment...")
+        combined = compute_ntl_scores(combined, base_dir=str(BASE_DIR))
+        combined = apply_ntl_to_scoring(combined)
+
+    # ── Mapillary infrastructure features ─────────────────────────────────────
+    mapillary_token = (
+        args.mapillary_token
+        or os.environ.get("MAPILLARY_TOKEN", "")
+    )
+    if mapillary_token:
+        from mapillary_features import enrich_with_mapillary, apply_mapillary_to_scoring
+        print("\n[Mapillary] Querying road infrastructure features...")
+        combined = enrich_with_mapillary(combined, token=mapillary_token,
+                                         cache_dir=str(BASE_DIR / "enrichment_data" / "mapillary_cache"))
+        combined = apply_mapillary_to_scoring(combined)
+    else:
+        print("\n[Mapillary] Skipped — set MAPILLARY_TOKEN env var or --mapillary-token flag")
+
     # Priority Index (Exposure × Likelihood × Severity) — runs alongside SSS,
     # does not replace it. See priority_scoring.py module docstring.
     combined = run_priority_scoring(combined)
@@ -363,6 +582,8 @@ def main():
 
     if corridors is not None and len(corridors):
         export_corridors(corridors, output_dir=args.out)
+
+    export_policy_brief(combined, corridors, output_dir=args.out)
 
     # ── Final file listing ────────────────────────────────────────────────
     print("\n" + "="*60)

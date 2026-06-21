@@ -144,7 +144,7 @@ class AmenityExtractor(osmium.SimpleHandler):
             }
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(geojson, f)
-            print(f"  Saved {len(features):,} {label} → {path}")
+            print(f"  Saved {len(features):,} {label} -> {path}")
 
 
 class RoadInfraExtractor(osmium.SimpleHandler):
@@ -210,7 +210,7 @@ class RoadInfraExtractor(osmium.SimpleHandler):
         geojson = {"type": "FeatureCollection", "features": self.ways}
         with open(self.out_path, "w", encoding="utf-8") as f:
             json.dump(geojson, f)
-        print(f"  Saved {len(self.ways):,} road ways → {self.out_path}")
+        print(f"  Saved {len(self.ways):,} road ways -> {self.out_path}")
 
 
 def find_pbf(folder, keywords):
@@ -235,10 +235,10 @@ def extract_country(pbf_path, bbox, country_code, out_dir="enrichment_data"):
     if Path(school_out).exists() and Path(hospital_out).exists():
         ns = len(json.load(open(school_out))["features"])
         nh = len(json.load(open(hospital_out))["features"])
-        print(f"  Already extracted: {ns} schools, {nh} hospitals — skipping")
+        print(f"  Already extracted: {ns} schools, {nh} hospitals - skipping")
     else:
         handler = AmenityExtractor(bbox, school_out, hospital_out)
-        print(f"  Scanning PBF file for schools/hospitals (1–3 minutes for country files)...")
+        print(f"  Scanning PBF file for schools/hospitals (1-3 minutes for country files)...")
         handler.apply_file(str(pbf_path), locations=False)
         handler.save()
         ns, nh = len(handler.schools), len(handler.hospitals)
@@ -248,11 +248,11 @@ def extract_country(pbf_path, bbox, country_code, out_dir="enrichment_data"):
     # amenity pass above; expect this to take longer on large country files.
     if Path(road_infra_out).exists():
         nr = len(json.load(open(road_infra_out))["features"])
-        print(f"  Already extracted: {nr} road ways — skipping")
+        print(f"  Already extracted: {nr} road ways - skipping")
     else:
         road_handler = RoadInfraExtractor(bbox, road_infra_out)
         print(f"  Scanning PBF file for road infrastructure tags "
-              f"(slower — resolves node locations onto ways)...")
+              f"(slower - resolves node locations onto ways)...")
         road_handler.apply_file(str(pbf_path), locations=True)
         road_handler.save()
         nr = len(road_handler.ways)
@@ -265,7 +265,7 @@ def main():
     out_dir  = "enrichment_data"
 
     print("=" * 60)
-    print("  OSM DATA EXTRACTOR — Schools & Hospitals")
+    print("  OSM DATA EXTRACTOR - Schools, Hospitals & Road Infra")
     print("=" * 60)
 
     if not osm_dir.exists():
@@ -285,7 +285,7 @@ def main():
         print("  Download from: https://download.geofabrik.de/asia/thailand-latest.osm.pbf")
 
     # India / Maharashtra
-    mh_pbf = find_pbf(osm_dir, ["maharashtra", "india", "ind"])
+    mh_pbf = find_pbf(osm_dir, ["maharashtra", "india", "ind", "western-zone", "western"])
     if mh_pbf:
         ns, nh, nr = extract_country(mh_pbf, MH_BBOX, "MH", out_dir)
         results["MH"] = (ns, nh, nr)

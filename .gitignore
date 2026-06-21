@@ -6,3 +6,8 @@ __pycache__/
 env/
 .venv/
 data/
+
+# Large data files — download separately (see README)
+enrichment_data/road_infra/
+enrichment_data/viirs/
+openSourceData/
