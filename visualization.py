@@ -539,6 +539,52 @@ def build_interactive_map(
                     pass
             fg_pi.add_to(m)
 
+    # Infrastructure blindspot layer — high-SSS segments with zero Mapillary
+    # coverage. These are dangerous AND invisible to digital monitoring systems.
+    # Shown off by default in a distinctive purple dashed style.
+    if "mapillary_blindspot" in scored.columns:
+        blindspots = scored[scored["mapillary_blindspot"].fillna(False).astype(bool)]
+        if len(blindspots):
+            fg_blind = folium.FeatureGroup(
+                name=f"👁️ Infrastructure Blindspots ({len(blindspots):,} — high SSS + no imagery)",
+                show=False,
+            )
+            for _, row in blindspots.iterrows():
+                try:
+                    geom = row.geometry
+                    sss  = row.get("sss", np.nan)
+                    cc   = row.get("country_code", "")
+                    rc   = row.get("road_class_norm", "—")
+                    popup_html = (
+                        f"<div style='font-family:Arial;width:260px;font-size:13px'>"
+                        f"<div style='background:#7c3aed;color:white;padding:8px;border-radius:4px 4px 0 0'>"
+                        f"<b>👁️ Infrastructure Blindspot</b></div>"
+                        f"<div style='padding:10px;border:1px solid #ddd;border-top:none'>"
+                        f"<b>SSS:</b> {sss:.1f} ({row.get('sss_band','—')})<br>"
+                        f"<b>Country:</b> {cc} &nbsp;|&nbsp; <b>Class:</b> {rc}<br>"
+                        f"<b>Posted limit:</b> {row.get('speed_limit','—')} km/h<br>"
+                        f"<hr style='margin:6px 0'>"
+                        f"<i style='color:#555;font-size:11px'>No Mapillary street imagery found "
+                        f"for this cell. Road is both high-risk and invisible to digital "
+                        f"monitoring systems — priority for enforcement camera deployment.</i>"
+                        f"</div></div>"
+                    )
+                    if geom.geom_type in ("LineString", "MultiLineString"):
+                        for seg_coords in _geom_to_latlon_list(geom):
+                            folium.PolyLine(
+                                locations=seg_coords,
+                                color="#7c3aed",
+                                weight=3,
+                                opacity=0.9,
+                                dash_array="6 4",
+                                popup=folium.Popup(popup_html, max_width=280),
+                                tooltip=f"Blindspot | SSS {sss:.0f} | {cc}",
+                            ).add_to(fg_blind)
+                except Exception:
+                    pass
+            fg_blind.add_to(m)
+            print(f"  Blindspot layer: {len(blindspots):,} segments")
+
     # Intervention zones — hidden by default, lines only (no fill).
     # These are attribute groups (country + region + road class + band),
     # NOT spatially contiguous corridors — see advanced_scoring.py.
@@ -666,6 +712,11 @@ def _build_legend_html() -> str:
       <div style="margin-top:4px;display:flex;align-items:center">
         <div style="width:12px;height:12px;background:#dc2626;border-radius:50%;margin-right:8px"></div>
         <span style="font-size:12px">Hospitals</span>
+      </div>
+      <div style="margin-top:8px;display:flex;align-items:center">
+        <div style="width:12px;height:3px;background:#7c3aed;margin-right:8px;
+                    border-top:2px dashed #7c3aed"></div>
+        <span style="font-size:12px">Blindspot (high SSS + no imagery)</span>
       </div>
       <div style="color:#aaa;font-size:11px;margin-top:8px">
         Same color scale used for both SSS (default view) and Priority Index<br>
