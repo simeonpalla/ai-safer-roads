@@ -87,6 +87,29 @@ SAFE_SYSTEM_THRESHOLDS = {
     ("unknown",     "unknown"):60,   # INTERPOLATED — moderate default
 }
 
+# ─── Interpolated cell registry ──────────────────────────────────────────────
+# Cells in SAFE_SYSTEM_THRESHOLDS that are NOT direct WHO citations.
+# Used by scoring.py to dampen the alignment sub-score for these cells —
+# the gap is real but measured against an estimated, not a verified, standard.
+SS_INTERPOLATED_CELLS = {
+    ("local",       "urban"),
+    ("tertiary",    "urban"),
+    ("trunk",       "urban"),
+    ("motorway",    "urban"),
+    ("local",       "rural"),
+    ("residential", "rural"),
+    ("tertiary",    "rural"),
+    ("trunk",       "rural"),
+    ("unknown",     "urban"),
+    ("unknown",     "unknown"),
+}
+
+# Multiply alignment sub-score by this factor when the ss_limit came from an
+# INTERPOLATED cell.  0.70 → "count it, but discount by 30% due to threshold
+# uncertainty."  Does NOT zero out the score; a posted 120 km/h on a local
+# urban road is still wrong even if the exact threshold is debatable.
+ALIGNMENT_INTERPOLATED_DAMPENER = 0.70
+
 # Aspirational Vision Zero targets (informational, not used in scoring)
 ASPIRATIONAL_SS_THRESHOLDS = {
     ("local",       "urban"):  30,

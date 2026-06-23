@@ -59,6 +59,7 @@ from config import (
     CREDIBILITY_GAP_CREDIBLE, CREDIBILITY_GAP_NONCREDIBLE,
     HELMET_SPI, HELMET_SEVERITY_WEIGHT,
     VRU_RC_SCORE_MAP,
+    SS_INTERPOLATED_CELLS, ALIGNMENT_INTERPOLATED_DAMPENER,
 )
 from geometry_features import sinuosity_ss_adjustment
 
@@ -103,6 +104,25 @@ WEIGHTS = {
     "limit_credibility_gap": 0.30,
     "vru_context_risk":      0.32,
 }
+
+
+def _is_threshold_interpolated(
+    road_class_norm: str,
+    land_use: str,
+    ghsl_settlement_class: str = None,
+) -> bool:
+    """
+    Returns True when the ss_limit for this segment came from an INTERPOLATED
+    cell in SAFE_SYSTEM_THRESHOLDS (i.e. not a direct WHO citation).
+    Uses the same GHSL → land_use override as get_safe_system_limit so the
+    interpolated flag is consistent with the limit that was actually used.
+    """
+    effective_lu = land_use
+    if ghsl_settlement_class and ghsl_settlement_class in _GHSL_TO_LAND_USE:
+        effective_lu = _GHSL_TO_LAND_USE[ghsl_settlement_class]
+    rc = (road_class_norm or "unknown").lower()
+    lu = (effective_lu or "unknown").lower()
+    return (rc, lu) in SS_INTERPOLATED_CELLS
 
 
 def get_safe_system_limit(
@@ -205,6 +225,20 @@ def add_safe_system_limits(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         ),
         axis=1,
     )
+    # Flag which rows used an INTERPOLATED table cell — used by
+    # score_speed_limit_alignment to dampen the sub-score for uncertain thresholds.
+    gdf["ss_limit_interpolated"] = gdf.apply(
+        lambda r: _is_threshold_interpolated(
+            r.get("road_class_norm", "unknown"),
+            r.get("land_use", "unknown"),
+            r.get("ghsl_settlement_class") if has_ghsl else None,
+        ),
+        axis=1,
+    )
+    n_interp = gdf["ss_limit_interpolated"].sum()
+    log.info(f"  SS limit: {len(gdf) - n_interp:,} VERIFIED cells, "
+             f"{n_interp:,} INTERPOLATED cells (alignment dampened {ALIGNMENT_INTERPOLATED_DAMPENER:.0%})")
+
     if has_ghsl:
         n_ghsl = gdf["ghsl_settlement_class"].notna().sum()
         log.info(f"  SS limit uses GHSL settlement class for {n_ghsl:,} segments")
@@ -219,17 +253,34 @@ def add_safe_system_limits(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     return gdf
 
 
-def score_speed_limit_alignment(posted: pd.Series, ss_limit: pd.Series) -> pd.Series:
+def score_speed_limit_alignment(
+    posted: pd.Series,
+    ss_limit: pd.Series,
+    is_interpolated: pd.Series = None,
+) -> pd.Series:
     """
     How misaligned is the posted limit vs Safe System standard?
     gap_pct = (posted - ss_limit) / ss_limit
     0 if gap<=0, 100 if gap>=50%, linear between.
 
+    is_interpolated — boolean Series aligned to posted/ss_limit index.
+      When True, the ss_limit came from an INTERPOLATED config cell (not a
+      direct WHO citation), so the gap is multiplied by ALIGNMENT_INTERPOLATED_DAMPENER
+      (0.70) to reflect threshold uncertainty.  A large gap still scores high;
+      a borderline gap on an uncertain threshold no longer punishes as hard.
+
     Example: posted=80, ss=50 → gap=60% → score=100 (capped)
     Example: posted=80, ss=70 → gap=14% → score=28.6
+    Example: posted=50, ss=40 (INTERPOLATED) → gap=25% → raw=50 → dampened=35
     """
     gap_pct = (posted - ss_limit) / ss_limit.replace(0, np.nan)
-    return np.clip(gap_pct / 0.50, 0, 1).fillna(0) * 100
+    raw = np.clip(gap_pct / 0.50, 0, 1).fillna(0) * 100
+
+    if is_interpolated is not None:
+        dampener = is_interpolated.map({True: ALIGNMENT_INTERPOLATED_DAMPENER, False: 1.0}).fillna(1.0)
+        raw = raw * dampener
+
+    return raw
 
 
 def score_limit_credibility_gap(
@@ -238,6 +289,8 @@ def score_limit_credibility_gap(
     osm_lanes: pd.Series = None,
     osm_surface: pd.Series = None,
     ghsl_settlement_class: pd.Series = None,
+    road_class_norm: pd.Series = None,
+    land_use: pd.Series = None,
 ) -> pd.Series:
     """
     Evidence that the posted limit does not match how the road is used.
@@ -247,13 +300,18 @@ def score_limit_credibility_gap(
     the limit has likely lost credibility and needs review — not that
     enforcement needs to increase.
 
-    ROAD-QUALITY DAMPENER (new): on well-built rural roads (4+ lanes, paved,
-    low-density settlement), a high F85 gap more plausibly indicates the
-    posted limit is SET TOO LOW for the road's design rather than that drivers
-    are recklessly speeding. Per the ADB FAQ: "concluding that a road needs a
-    lower speed limit simply because F85 is high could be dangerous if the road
-    design is meant for higher speeds." The dampener halves the penalty in that
-    specific combination — it does NOT apply in urban/suburban or unpaved settings.
+    ROAD-QUALITY DAMPENER: on well-built rural roads, a high F85 gap more
+    plausibly indicates the posted limit is SET TOO LOW for the road's design
+    rather than that drivers are recklessly speeding. Per the ADB FAQ:
+    "concluding that a road needs a lower speed limit simply because F85 is
+    high could be dangerous if the road design is meant for higher speeds."
+    The dampener halves the penalty — it does NOT apply in urban/suburban or
+    unpaved settings.
+
+    v3.2 FIX: the original required osm_lanes >= 4 which almost never fires
+    (OSM lane tags are sparse in India/Thailand). New primary condition:
+    road_class_norm in {primary, trunk, motorway} + rural GHSL/land_use +
+    not unpaved.  The 4+ lanes condition still fires as an alternative path.
 
     gap <= 10 km/h ("Credible")     → 0
     gap >= 20 km/h ("Non-Credible") → 100 (or 50 if road-quality dampener active)
@@ -262,22 +320,47 @@ def score_limit_credibility_gap(
     span = CREDIBILITY_GAP_NONCREDIBLE - CREDIBILITY_GAP_CREDIBLE
     raw  = np.clip((gap - CREDIBILITY_GAP_CREDIBLE) / span, 0, 1).fillna(0) * 100
 
-    # Road-quality dampener — only when all three signals point to "high quality rural"
-    if osm_lanes is not None or osm_surface is not None or ghsl_settlement_class is not None:
-        rural_classes = {"low_density_rural", "very_low_density_rural"}
-        is_hq_rural = pd.Series(True, index=raw.index)
+    has_any_signal = any(
+        x is not None for x in
+        [osm_lanes, osm_surface, ghsl_settlement_class, road_class_norm, land_use]
+    )
+    if not has_any_signal:
+        return raw
 
-        if osm_lanes is not None:
-            is_hq_rural &= osm_lanes.fillna(0) >= 4
-        if osm_surface is not None:
-            is_hq_rural &= ~osm_surface.fillna("").isin(_UNPAVED_SURFACES)
-        if ghsl_settlement_class is not None:
-            is_hq_rural &= ghsl_settlement_class.isin(rural_classes)
-        else:
-            # Without GHSL we can't confirm "rural" — don't apply dampener
-            is_hq_rural &= False
+    rural_ghsl = {"low_density_rural", "very_low_density_rural"}
+    major_classes = {"primary", "trunk", "motorway"}
 
-        raw = raw * np.where(is_hq_rural, 0.5, 1.0)
+    # ── Is the road confirmed rural? ─────────────────────────────────────────
+    # Prefer GHSL (research-grade classification) over binary land_use field.
+    if ghsl_settlement_class is not None:
+        is_rural = ghsl_settlement_class.isin(rural_ghsl)
+    elif land_use is not None:
+        is_rural = land_use.fillna("").eq("rural")
+    else:
+        # No rural signal at all — don't apply dampener (conservative)
+        return raw
+
+    # ── Is the surface paved? ────────────────────────────────────────────────
+    not_unpaved = pd.Series(True, index=raw.index)
+    if osm_surface is not None:
+        not_unpaved = ~osm_surface.fillna("").isin(_UNPAVED_SURFACES)
+
+    # ── Is the road major class OR wide? ─────────────────────────────────────
+    # Primary condition (v3.2): major road class — fires even without osm_lanes.
+    is_major = pd.Series(False, index=raw.index)
+    if road_class_norm is not None:
+        is_major = road_class_norm.fillna("").isin(major_classes)
+
+    # Alternative condition (original): 4+ lanes tagged in OSM.
+    has_many_lanes = pd.Series(False, index=raw.index)
+    if osm_lanes is not None:
+        has_many_lanes = osm_lanes.fillna(0) >= 4
+
+    is_wide_or_major = is_major | has_many_lanes
+
+    # Dampener: rural + paved + (major class or wide)
+    is_hq_rural = is_rural & not_unpaved & is_wide_or_major
+    raw = raw * np.where(is_hq_rural, 0.5, 1.0)
 
     return raw
 
@@ -378,7 +461,9 @@ def compute_speed_safety_score(
     mask = gdf["scoreable"]
 
     gdf.loc[mask, "sub_score_limit_alignment"] = score_speed_limit_alignment(
-        gdf.loc[mask, "speed_limit"], gdf.loc[mask, "ss_limit"]
+        gdf.loc[mask, "speed_limit"],
+        gdf.loc[mask, "ss_limit"],
+        is_interpolated = gdf.loc[mask, "ss_limit_interpolated"] if "ss_limit_interpolated" in gdf.columns else None,
     )
     gdf.loc[mask, "sub_score_limit_credibility"] = score_limit_credibility_gap(
         gdf.loc[mask, "speed_85th"],
@@ -386,6 +471,8 @@ def compute_speed_safety_score(
         osm_lanes             = gdf.loc[mask, "osm_lanes"]             if "osm_lanes"             in gdf.columns else None,
         osm_surface           = gdf.loc[mask, "osm_surface"]           if "osm_surface"           in gdf.columns else None,
         ghsl_settlement_class = gdf.loc[mask, "ghsl_settlement_class"] if "ghsl_settlement_class" in gdf.columns else None,
+        road_class_norm       = gdf.loc[mask, "road_class_norm"]       if "road_class_norm"       in gdf.columns else None,
+        land_use              = gdf.loc[mask, "land_use"]               if "land_use"               in gdf.columns else None,
     )
     gdf.loc[mask, "sub_score_vru_risk"] = score_vru_context_risk(gdf[mask])
 
@@ -412,7 +499,10 @@ def compute_speed_safety_score(
         gdf.loc[mask, "sss_raw"] * gdf.loc[mask, "confidence_weight"]
     ).clip(0, 100)
 
-    gdf.loc[mask, "sss_band"] = gdf.loc[mask, "sss"].apply(classify_band)
+    gdf.loc[mask, "sss_band"] = gdf.loc[mask].apply(
+        lambda r: classify_band(r["sss"], r.get("sub_score_limit_credibility")),
+        axis=1,
+    )
     gdf["low_data_flag"] = (
         gdf["sample_size"].fillna(0) < MIN_SAMPLE_SIZE
     ) & gdf["scoreable"]
@@ -445,19 +535,41 @@ def compute_alignment_only_score(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     mask = gdf["alignment_scoreable"]
 
     gdf.loc[mask, "alignment_only_score"] = score_speed_limit_alignment(
-        gdf.loc[mask, "speed_limit"], gdf.loc[mask, "ss_limit"]
+        gdf.loc[mask, "speed_limit"],
+        gdf.loc[mask, "ss_limit"],
+        is_interpolated = gdf.loc[mask, "ss_limit_interpolated"] if "ss_limit_interpolated" in gdf.columns else None,
     )
     gdf.loc[mask, "alignment_only_band"] = gdf.loc[mask, "alignment_only_score"].apply(classify_band)
     return gdf
 
 
-def classify_band(score: float) -> str:
+def classify_band(score: float, credibility_sub_score: float = None) -> str:
+    """
+    Assign a band label to a Speed Safety Score.
+
+    CRITICAL GATE (v3.2): a segment can only reach Critical if the
+    credibility sub-score is >= 25, meaning there is at least a ~15 km/h
+    behavioural gap confirming the limit is not working.  When the limit is
+    wrong (high alignment) but drivers respect it (low credibility gap), the
+    road is still High Risk — urgent, but not the same as one where both the
+    limit AND the behaviour are dangerous.
+
+    credibility_sub_score is optional so classify_band remains usable for
+    alignment_only_score (Tier 1) where no behavioural data exists.
+    """
     if pd.isna(score):
         return "No Data"
     for band, (lo, hi) in SCORE_BANDS.items():
         if lo <= score < hi:
+            if band == "Critical" and credibility_sub_score is not None:
+                if credibility_sub_score < 25:
+                    return "High Risk"
             return band
-    return "Critical" if score >= max(lo for lo, _ in SCORE_BANDS.values()) else "Acceptable"
+    # score == 100 or above upper boundary
+    final = "Critical" if score >= max(lo for lo, _ in SCORE_BANDS.values()) else "Acceptable"
+    if final == "Critical" and credibility_sub_score is not None and credibility_sub_score < 25:
+        return "High Risk"
+    return final
 
 
 def _generate_recommendation(row: pd.Series) -> str:
