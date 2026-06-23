@@ -342,6 +342,11 @@ EXPOSURE_WEIGHTS = {
     "intersections":   0.20,   # OSM junction density — optional local file
     "schools":         0.12,   # within 500m buffer — optional local file
     "hospitals":       0.08,   # within 750m buffer — optional local file
+    "markets":         0.10,   # markets/bazaars within 400m — high pedestrian density in TH/MH
+    "transit":         0.08,   # bus stops/stations within 300m — road-crossing hotspots
+    "religious":       0.08,   # temples/mosques within 400m — 32k wats in TH alone
+    "university":      0.05,   # universities/colleges within 500m — motorcycle/bicycle commuters
+    "crossings":       0.06,   # railway level crossings within 200m — extreme fatality risk (MH)
 }
 
 # ── Likelihood layer weights ─────────────────────────────────────────────

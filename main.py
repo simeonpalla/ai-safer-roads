@@ -10,6 +10,7 @@ Usage:
 
 import argparse
 import io
+import logging
 import os
 import sys
 import warnings
@@ -27,6 +28,9 @@ import geopandas as gpd
 
 warnings.filterwarnings("ignore")
 
+from logger import configure as configure_logging, get_logger
+log = get_logger(__name__)
+
 from preprocessing    import load_maharashtra, load_thailand, load_helmet_data, \
                              merge_datasets, get_analysis_subset
 from scoring          import add_safe_system_limits, compute_speed_safety_score, \
@@ -37,6 +41,7 @@ from advanced_scoring import run_advanced_scoring
 from enrichment import enrich_segments
 from priority_scoring import run_priority_scoring
 from ml_extension     import run_ml_extension
+from ghsl_features    import compute_ghsl_settlement
 from evaluation       import run_full_evaluation, plot_score_overview
 from visualization    import build_interactive_map, export_for_esri, export_corridors, \
                              plot_sss_vs_pct_over_limit, plot_shap_importance
@@ -64,6 +69,10 @@ def parse_args():
     p.add_argument("--mapillary-token",  default=None,
                    help="Mapillary API token (or set MAPILLARY_TOKEN env var)")
     p.add_argument("--demo",             action="store_true")
+    p.add_argument("--verbose", "-v",    action="store_true",
+                   help="Show DEBUG-level logs")
+    p.add_argument("--quiet",  "-q",     action="store_true",
+                   help="Suppress INFO logs (WARNING and above only)")
     return p.parse_args()
 
 
@@ -72,9 +81,9 @@ def parse_args():
 def run_demo_mode() -> gpd.GeoDataFrame:
     from shapely.geometry import LineString
 
-    print("\n" + "="*60)
-    print("  DEMO MODE — synthetic data (real structure)")
-    print("="*60)
+    log.info("\n" + "="*60)
+    log.info("  DEMO MODE — synthetic data (real structure)")
+    log.info("="*60)
 
     np.random.seed(42)
     N = 600
@@ -148,9 +157,9 @@ def print_policy_summary(gdf: gpd.GeoDataFrame, corridors: gpd.GeoDataFrame) -> 
     mask = gdf["scoreable"] & gdf["sss"].notna()
     df   = gdf[mask]
 
-    print("\n" + "="*60)
-    print("  POLICY SUMMARY")
-    print("="*60)
+    log.info("\n" + "="*60)
+    log.info("  POLICY SUMMARY")
+    log.info("="*60)
 
     # Network coverage caveat — stated up front, not left for a reviewer to
     # discover and ask about. The gap is a property of the source ADB data
@@ -160,63 +169,63 @@ def print_policy_summary(gdf: gpd.GeoDataFrame, corridors: gpd.GeoDataFrame) -> 
     total_segments = len(gdf)
     n_scored = mask.sum()
     n_tier1  = gdf["alignment_scoreable"].sum() if "alignment_scoreable" in gdf.columns else 0
-    print(f"\n  Network Coverage:")
-    print(f"    Tier 2 (full SSS, behaviourally confirmed): {n_scored:,} / "
-          f"{total_segments:,} segments ({100*n_scored/total_segments:.1f}%)")
-    print(f"    Tier 1 (limit-vs-Safe-System-standard only): {n_tier1:,} / "
-          f"{total_segments:,} segments ({100*n_tier1/total_segments:.1f}%)")
-    print(f"    Unscored:   {total_segments - n_tier1:,} segments lack even a posted "
-          f"limit — these are excluded, not scored as 'safe'.")
+    log.info(f"\n  Network Coverage:")
+    log.info(f"    Tier 2 (full SSS, behaviourally confirmed): {n_scored:,} / "
+             f"{total_segments:,} segments ({100*n_scored/total_segments:.1f}%)")
+    log.info(f"    Tier 1 (limit-vs-Safe-System-standard only): {n_tier1:,} / "
+             f"{total_segments:,} segments ({100*n_tier1/total_segments:.1f}%)")
+    log.info(f"    Unscored:   {total_segments - n_tier1:,} segments lack even a posted "
+             f"limit — these are excluded, not scored as 'safe'.")
 
     # Nilsson
     if "nilsson_fatal_ratio" in df.columns:
         gt2 = (df["nilsson_fatal_ratio"] > 2).sum()
         gt4 = (df["nilsson_fatal_ratio"] > 4).sum()
         mx  = df["nilsson_fatal_ratio"].max()
-        print(f"\n  Fatal Crash Risk (Nilsson Power Model):")
-        print(f"    >2× baseline risk:  {gt2:,} segments")
-        print(f"    >4× baseline risk:  {gt4:,} segments")
-        print(f"    Max risk ratio:     {mx:.1f}×")
+        log.info(f"\n  Fatal Crash Risk (Nilsson Power Model):")
+        log.info(f"    >2× baseline risk:  {gt2:,} segments")
+        log.info(f"    >4× baseline risk:  {gt4:,} segments")
+        log.info(f"    Max risk ratio:     {mx:.1f}×")
 
     # Credibility
     if "credibility_class" in df.columns:
-        print(f"\n  Speed Limit Credibility:")
+        log.info(f"\n  Speed Limit Credibility:")
         for cat in ["Credible","Low Credibility","Non-Credible","Under-Speed"]:
             n = (df["credibility_class"] == cat).sum()
             if n:
-                print(f"    {cat:<22} {n:>6,}  ({100*n/len(df):.1f}%)")
+                log.info(f"    {cat:<22} {n:>6,}  ({100*n/len(df):.1f}%)")
 
     # Change effort
     if "change_effort" in df.columns:
-        print(f"\n  Speed Limit Changes Needed:")
+        log.info(f"\n  Speed Limit Changes Needed:")
         for cat in ["No change needed","Minor (<=10 km/h)",
                     "Moderate (11-20 km/h)","Major (>20 km/h)"]:
             n = (df["change_effort"] == cat).sum()
             if n:
-                print(f"    {cat:<28} {n:>6,}  ({100*n/len(df):.1f}%)")
+                log.info(f"    {cat:<28} {n:>6,}  ({100*n/len(df):.1f}%)")
 
     # Lives saved
     if "est_lives_saved" in df.columns:
         total = df["est_lives_saved"].sum()
         lower = df["lives_saved_lower"].sum()
         upper = df["lives_saved_upper"].sum()
-        print(f"\n  Estimated Annual Lives Saved (if all limits corrected):")
-        print(f"    Central:  {total:.1f}   Range: {lower:.1f} – {upper:.1f}")
-        print(f"    ⚠ ILLUSTRATIVE, NOT VALIDATED — depends on an unverified")
-        print(f"    GPS-sample-to-vehicle-km conversion (config.VKM_PER_WEIGHTED_SAMPLE).")
-        print(f"    Use for RELATIVE comparison across segments, not as a public figure.")
+        log.info(f"\n  Estimated Annual Lives Saved (if all limits corrected):")
+        log.info(f"    Central:  {total:.1f}   Range: {lower:.1f} – {upper:.1f}")
+        log.info(f"    ⚠ ILLUSTRATIVE, NOT VALIDATED — depends on an unverified")
+        log.info(f"    GPS-sample-to-vehicle-km conversion (config.VKM_PER_WEIGHTED_SAMPLE).")
+        log.info(f"    Use for RELATIVE comparison across segments, not as a public figure.")
 
     # Priority Index (Exposure × Likelihood × Severity) — alongside SSS
     if "priority_index" in df.columns:
-        print(f"\n  Priority Index (Exposure × Likelihood × Severity) — SECONDARY")
-        print(f"  'where to act first' layer. The Tier 1/2 scores above are the")
-        print(f"  primary answer to 'is this speed limit appropriate.'")
+        log.info(f"\n  Priority Index (Exposure × Likelihood × Severity) — SECONDARY")
+        log.info(f"  'where to act first' layer. The Tier 1/2 scores above are the")
+        log.info(f"  primary answer to 'is this speed limit appropriate.'")
         for cat in ["Critical", "High Risk", "Moderate", "Acceptable"]:
             n = (df["priority_band"] == cat).sum()
             if n:
-                print(f"    {cat:<22} {n:>6,}  ({100*n/len(df):.1f}%)")
-        print(f"    (Provisional bands — see config.PRIORITY_BANDS docstring "
-              f"on recalibrating against real data)")
+                log.info(f"    {cat:<22} {n:>6,}  ({100*n/len(df):.1f}%)")
+        log.info(f"    (Provisional bands — see config.PRIORITY_BANDS docstring "
+                 f"on recalibrating against real data)")
 
     # Uncovered risk: high-SSS roads that traffic-volume tools would miss
     if "ranked_percentile" in df.columns and df["ranked_percentile"].notna().any():
@@ -224,30 +233,30 @@ def print_policy_summary(gdf: gpd.GeoDataFrame, corridors: gpd.GeoDataFrame) -> 
         n_uncovered = int(
             ((df["sss"] >= 40) & (df["ranked_percentile"] <= rp_cutoff)).sum()
         )
-        print(f"\n  Roads missed by traffic-volume prioritisation:")
-        print(f"    SSS >= 40 AND bottom 25% by traffic volume: {n_uncovered:,} segments")
-        print(f"    These are flagged by this model but would be de-prioritised")
-        print(f"    by approaches that rank roads only by traffic count.")
+        log.info(f"\n  Roads missed by traffic-volume prioritisation:")
+        log.info(f"    SSS >= 40 AND bottom 25% by traffic volume: {n_uncovered:,} segments")
+        log.info(f"    These are flagged by this model but would be de-prioritised")
+        log.info(f"    by approaches that rank roads only by traffic count.")
 
     # Intervention zones (attribute groups, not spatial corridors — see
     # advanced_scoring.detect_corridors docstring)
     if corridors is not None and len(corridors):
         saved_col = "est_lives_saved" if "est_lives_saved" in corridors.columns else None
         total_corr_saved = corridors[saved_col].sum() if saved_col else 0
-        print(f"\n  High-Risk Intervention Zones:")
-        print(f"    Zones detected:      {len(corridors)}")
-        print(f"    Segments covered:    {corridors['n_segments'].sum():,}")
+        log.info(f"\n  High-Risk Intervention Zones:")
+        log.info(f"    Zones detected:      {len(corridors)}")
+        log.info(f"    Segments covered:    {corridors['n_segments'].sum():,}")
         if saved_col:
-            print(f"    Lives saved (illustrative): {total_corr_saved:.1f}/yr (central)")
+            log.info(f"    Lives saved (illustrative): {total_corr_saved:.1f}/yr (central)")
 
-        print(f"\n  Top 5 Priority Intervention Zones:")
+        log.info(f"\n  Top 5 Priority Intervention Zones:")
         show = [c for c in ["priority_rank","country_code","n_segments",
                              "corridor_label","sss",
                              "nilsson_fatal_ratio","est_lives_saved"]
                 if c in corridors.columns]
-        print(corridors[show].head(5).round(2).to_string(index=False))
+        log.info(corridors[show].head(5).round(2).to_string(index=False))
 
-    print()
+    log.info("")
 
 
 
@@ -255,16 +264,18 @@ def print_policy_summary(gdf: gpd.GeoDataFrame, corridors: gpd.GeoDataFrame) -> 
 
 def main():
     args = parse_args()
+    configure_logging(verbose=args.verbose, quiet=args.quiet)
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     args.out = str(Path(args.out) / f"run_{timestamp}")
 
     Path(args.out).mkdir(parents=True, exist_ok=True)
 
-    print(f"\nOutput folder: {args.out}")
+    log.info(f"\nOutput folder: {args.out}")
 
-    print("\n" + "="*60)
-    print("  ADB AI FOR SAFER ROADS — SPEED SAFETY SCORE PIPELINE")
-    print("="*60)
+    log.info("\n" + "="*60)
+    log.info("  ADB AI FOR SAFER ROADS — SPEED SAFETY SCORE PIPELINE")
+    log.info("="*60)
 
     # ── Step 1: Load ──────────────────────────────────────────────────────
     if args.demo:
@@ -272,34 +283,41 @@ def main():
     else:
         missing = [p for p in [args.mh, args.th] if not Path(p).exists()]
         if missing:
-            print(f"\n  Missing files: {missing}")
-            print("  Run with --demo to test with synthetic data")
+            log.error(f"\n  Missing files: {missing}")
+            log.error("  Run with --demo to test with synthetic data")
             sys.exit(1)
 
-        print("\n[1/6] Loading datasets...")
+        log.info("\n[1/6] Loading datasets...")
         mh = load_maharashtra(args.mh)
         th = load_thailand(args.th)
         if Path(args.helmet).exists():
             helmet_df = load_helmet_data(args.helmet)
-            print(f"  Helmet data: {len(helmet_df)} records loaded")
+            log.info(f"  Helmet data: {len(helmet_df)} records loaded")
 
-        print("\n[2/6] Merging datasets...")
+        log.info("\n[2/6] Merging datasets...")
         combined = merge_datasets(mh, th)
         combined = get_analysis_subset(combined)
 
     # ── Step 2: Road geometry features ───────────────────────────────────
     step_label = "[2/6]" if args.demo else "[3/6]"
-    print(f"\n{step_label} Extracting road geometry features...")
+    log.info(f"\n{step_label} Extracting road geometry features...")
     combined = compute_geometry_features(combined)
+
+    # ── GHSL settlement classification ────────────────────────────────────
+    # Runs before scoring so get_safe_system_limit() and score_vru_context_risk()
+    # can use the 7-level settlement class instead of the binary land_use field.
+    # Gracefully skips if enrichment_data/ghsl/GHS_SMOD_E2025.tif is not present.
+    log.info("\n[GHSL] Sampling settlement classification...")
+    combined = compute_ghsl_settlement(combined, base_dir=str(BASE_DIR))
 
     # ── Step 3: Safe System limits ────────────────────────────────────────
     step_label = "[3/6]" if args.demo else "[4/6]"
-    print(f"\n{step_label} Computing Safe System reference limits (with geometry adjustment)...")
+    log.info(f"\n{step_label} Computing Safe System reference limits (with geometry adjustment)...")
     combined = add_safe_system_limits(combined)
 
     # ── Step 4: Base SSS ──────────────────────────────────────────────────
     step_label = "[4/6]" if args.demo else "[5/6]"
-    print(f"\n{step_label} Computing Speed Safety Scores (base)...")
+    log.info(f"\n{step_label} Computing Speed Safety Scores (base)...")
     combined = compute_speed_safety_score(combined)
 
     # Tier 1 — alignment-only score (posted limit vs Safe System standard,
@@ -309,24 +327,24 @@ def main():
     combined = compute_alignment_only_score(combined)
     n_t1 = combined["alignment_scoreable"].sum()
     n_t2 = combined["scoreable"].sum()
-    print(f"\n  Tier 1 (alignment-only, no behavioural data needed): "
-          f"{n_t1:,} / {len(combined):,} segments ({100*n_t1/len(combined):.1f}%)")
-    print(f"  Tier 2 (full SSS, behaviourally confirmed):           "
-          f"{n_t2:,} / {len(combined):,} segments ({100*n_t2/len(combined):.1f}%)")
+    log.info(f"\n  Tier 1 (alignment-only, no behavioural data needed): "
+             f"{n_t1:,} / {len(combined):,} segments ({100*n_t1/len(combined):.1f}%)")
+    log.info(f"  Tier 2 (full SSS, behaviourally confirmed):           "
+             f"{n_t2:,} / {len(combined):,} segments ({100*n_t2/len(combined):.1f}%)")
 
     # Quick SSS preview
     mask = combined["scoreable"] & combined["sss"].notna()
     if mask.any():
-        print(f"\n  Top 5 highest-risk segments:")
+        log.info(f"\n  Top 5 highest-risk segments:")
         cols = [c for c in ["segment_id","country_code","road_class_norm",
                              "land_use","speed_limit","ss_limit",
                              "speed_85th","sss","sss_band"]
                 if c in combined.columns]
-        print(combined[mask].nlargest(5,"sss")[cols].to_string(index=False))
+        log.info(combined[mask].nlargest(5,"sss")[cols].to_string(index=False))
 
     # ── Step 4: Advanced scoring ──────────────────────────────────────────
     step_label = "[4/6]" if args.demo else "[5/6]"
-    print(f"\n{step_label} Running advanced scoring modules...")
+    log.info(f"\n{step_label} Running advanced scoring modules...")
     combined, corridors = run_advanced_scoring(combined)
 
 # AI anomaly detection (EXPERIMENTAL — not surfaced in map/popup/policy
@@ -352,12 +370,25 @@ def main():
     )
     if mapillary_token:
         from mapillary_features import enrich_with_mapillary, apply_mapillary_to_scoring
-        print("\n[Mapillary] Querying road infrastructure features...")
-        combined = enrich_with_mapillary(combined, token=mapillary_token,
-                                         cache_dir=str(BASE_DIR / "enrichment_data" / "mapillary_cache"))
+        # Target API queries at Critical + High Risk segments only — these are the
+        # segments where infrastructure visibility evidence matters most.  Results
+        # are still written to all segments sharing the same grid cell.
+        priority_mask = None
+        if "sss_band" in combined.columns:
+            priority_mask = combined["sss_band"].isin(["Critical", "High Risk"])
+            n_priority = int(priority_mask.sum())
+            log.info(f"\n[Mapillary] Targeting {n_priority:,} Critical + High Risk segments")
+        else:
+            log.info("\n[Mapillary] Querying road infrastructure features (all segments)...")
+        combined = enrich_with_mapillary(
+            combined,
+            token=mapillary_token,
+            cache_dir=str(BASE_DIR / "enrichment_data" / "mapillary_cache"),
+            segment_mask=priority_mask,
+        )
         combined = apply_mapillary_to_scoring(combined)
     else:
-        print("\n[Mapillary] Skipped — set MAPILLARY_TOKEN env var or --mapillary-token flag")
+        log.info("\n[Mapillary] Skipped — set MAPILLARY_TOKEN env var or --mapillary-token flag")
 
     # Priority Index (Exposure × Likelihood × Severity) — runs alongside SSS,
     # does not replace it. See priority_scoring.py module docstring.

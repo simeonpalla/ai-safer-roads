@@ -93,6 +93,7 @@ def _build_popup_html(row: pd.Series) -> str:
     pct_over = row.get("pct_over_limit", np.nan)
     rc       = row.get("road_class", "—")
     lu       = row.get("land_use", "—")
+    ghsl_cls = row.get("ghsl_settlement_class", None)
     country  = row.get("country", "—")
     rec      = row.get("sss_recommendation", "")
     img_url  = row.get("image_url", "")
@@ -191,7 +192,7 @@ def _build_popup_html(row: pd.Series) -> str:
         <b>Segment:</b> {seg_id}<br>
         <b>Country:</b> {country}<br>
         <b>Road class:</b> {rc}<br>
-        <b>Land use:</b> {lu}<br>
+        <b>Land use:</b> {lu}{f' → <span style="color:#1a6fa8"><b>{ghsl_cls.replace("_"," ")}</b></span> (GHSL)' if ghsl_cls and str(ghsl_cls) not in ("nan","None","no_data") else ""}<br>
         <hr style="margin:6px 0">
         <b>Posted limit:</b> {fmt(sl, ' km/h')}<br>
         <b>Safe System limit:</b> {fmt(ss, ' km/h')}<br>

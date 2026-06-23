@@ -47,10 +47,12 @@ interpolations for table consistency, not literal citations — see
 config.py's SAFE_SYSTEM_THRESHOLDS comment for the full breakdown by cell.
 """
 
+import logging
 import numpy as np
 import pandas as pd
 import geopandas as gpd
 
+from logger import get_logger
 from config import (
     SAFE_SYSTEM_THRESHOLDS, SCORE_BANDS,
     MIN_SAMPLE_SIZE, LOW_SAMPLE_PENALTY,
@@ -60,6 +62,41 @@ from config import (
 )
 from geometry_features import sinuosity_ss_adjustment
 
+log = get_logger(__name__)
+
+# ── GHSL settlement → scoring mappings ───────────────────────────────────────
+# Defined here (not imported from ghsl_features.py) so scoring.py stays
+# self-contained and the sensitivity analysis can call these functions
+# without pulling in rasterio.
+
+# Override land_use for Safe System threshold lookup
+_GHSL_TO_LAND_USE = {
+    "urban_centre":           "urban",
+    "dense_urban":            "urban",
+    "semi_dense_urban":       "urban",
+    "suburban":               "urban",   # conservative: suburban ≈ urban for limit purposes
+    "rural_cluster":          "rural",
+    "low_density_rural":      "rural",
+    "very_low_density_rural": "rural",
+}
+
+# 7-level VRU base score replacing binary urban=80/rural=35
+_GHSL_VRU_BASE = {
+    "urban_centre":           80,
+    "dense_urban":            76,
+    "semi_dense_urban":       70,
+    "suburban":               62,
+    "rural_cluster":          50,  # small settlement — real pedestrian activity
+    "low_density_rural":      38,
+    "very_low_density_rural": 28,
+}
+
+# OSM surface values that indicate unpaved / poor condition
+_UNPAVED_SURFACES = {
+    "unpaved", "gravel", "dirt", "ground", "sand",
+    "earth", "laterite", "compacted", "fine_gravel",
+}
+
 # Weights — compliance removed, weight redistributed
 WEIGHTS = {
     "speed_limit_alignment": 0.38,
@@ -68,34 +105,59 @@ WEIGHTS = {
 }
 
 
-def get_safe_system_limit(road_class_norm: str, land_use: str,
-                           osm_oneway: str = None, osm_lanes: float = None,
-                           sinuosity: float = 1.0) -> float:
+def get_safe_system_limit(
+    road_class_norm: str,
+    land_use: str,
+    osm_oneway: str = None,
+    osm_lanes: float = None,
+    sinuosity: float = 1.0,
+    osm_surface: str = None,
+    osm_lit: str = None,
+    ghsl_settlement_class: str = None,
+) -> float:
     """
     Safe System speed ceiling for this road.
 
-    OSM-EVIDENCE OVERRIDE: if enrichment found a real OSM tag confirming
-    physical separation (oneway=yes or 4+ lanes), the road's crash-type
-    context shifts toward "fully separated" (WHO 100 km/h tier) —
-    replacing an assumption with an observed fact.
+    Evidence hierarchy (each layer refines the base, strictly downward except
+    for the physical-separation override which can raise the ceiling):
 
-    GEOMETRY ADJUSTMENT (new): sinuous alignments restrict sight distance and
-    reaction time, lowering the speed at which a crash is survivable.
-    Grounded in AASHTO Green Book Table 3-6 (design speed vs curvature) and
-    iRAP star-rating methodology (sinuosity as explicit risk attribute).
-    Adjustment is strictly downward; floor is 30 km/h (WHO VRU-mixing tier).
+    1. GHSL settlement class — overrides the binary land_use field with a
+       research-grade 7-level classification (urban_centre → very_low_density_rural).
+       Suburban is treated as urban: still has real pedestrian exposure.
+
+    2. Road class × land_use table — SAFE_SYSTEM_THRESHOLDS baseline.
+
+    3. OSM physical separation (oneway=yes or 4+ lanes) — raises ceiling to
+       WHO divided-road tier (no head-on crash risk). Observed fact > assumption.
+
+    4. OSM surface quality — unpaved/gravel/dirt roads reduce ceiling by 10 km/h:
+       loss-of-control risk at high speed is substantially higher on loose surfaces.
+
+    5. OSM lighting — unlit roads outside urban centres reduce ceiling by 5 km/h:
+       reaction distance is longer at night; Safe System standards implicitly
+       assume adequate visibility.
+
+    6. Geometry (sinuosity) — curved alignments reduce ceiling per AASHTO
+       Green Book Table 3-6. Strictly downward, floor 30 km/h.
     """
+    # Step 1: GHSL overrides binary land_use where available
+    effective_lu = land_use
+    if ghsl_settlement_class and ghsl_settlement_class in _GHSL_TO_LAND_USE:
+        effective_lu = _GHSL_TO_LAND_USE[ghsl_settlement_class]
+
     key = (
         road_class_norm.lower() if pd.notna(road_class_norm) else "unknown",
-        land_use.lower() if pd.notna(land_use) else "unknown",
+        effective_lu.lower() if pd.notna(effective_lu) else "unknown",
     )
+
+    # Step 2: base from road class × land use table
     if key in SAFE_SYSTEM_THRESHOLDS:
         base = float(SAFE_SYSTEM_THRESHOLDS[key])
     else:
         fallback = ("unknown", key[1])
         base = float(SAFE_SYSTEM_THRESHOLDS.get(fallback, SAFE_SYSTEM_THRESHOLDS[("unknown", "unknown")]))
 
-    # OSM-confirmed physical separation → no head-on risk
+    # Step 3: OSM-confirmed physical separation → no head-on risk → raise ceiling
     is_divided_confirmed = (
         (pd.notna(osm_oneway) and str(osm_oneway).lower() == "yes") or
         (pd.notna(osm_lanes) and osm_lanes >= 4)
@@ -103,7 +165,18 @@ def get_safe_system_limit(road_class_norm: str, land_use: str,
     if is_divided_confirmed and key[0] != "motorway":
         base = max(base, 100.0) if key[1] == "rural" else max(base, 80.0)
 
-    # Geometry adjustment — curved roads require lower design speed
+    # Step 4: unpaved surface → lower ceiling (loss-of-control risk)
+    if pd.notna(osm_surface) and str(osm_surface).lower() in _UNPAVED_SURFACES:
+        base = max(base - 10.0, 30.0)
+
+    # Step 5: unlit road outside urban core → lower ceiling
+    is_urban_core = effective_lu == "urban" and ghsl_settlement_class in (
+        "urban_centre", "dense_urban", "semi_dense_urban", None
+    )
+    if pd.notna(osm_lit) and str(osm_lit).lower() == "no" and not is_urban_core:
+        base = max(base - 5.0, 30.0)
+
+    # Step 6: geometry adjustment — curved roads require lower design speed
     reduction = sinuosity_ss_adjustment(sinuosity if pd.notna(sinuosity) else 1.0)
     if reduction > 0:
         base = max(base - reduction, 30.0)
@@ -113,22 +186,36 @@ def get_safe_system_limit(road_class_norm: str, land_use: str,
 
 def add_safe_system_limits(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     gdf = gdf.copy()
-    has_osm = "osm_oneway" in gdf.columns or "osm_lanes" in gdf.columns
-    has_sinuosity = "sinuosity" in gdf.columns
+    has_osm      = "osm_oneway" in gdf.columns or "osm_lanes" in gdf.columns
+    has_sinuosity= "sinuosity" in gdf.columns
+    has_surface  = "osm_surface" in gdf.columns
+    has_lit      = "osm_lit" in gdf.columns
+    has_ghsl     = "ghsl_settlement_class" in gdf.columns
+
     gdf["ss_limit"] = gdf.apply(
         lambda r: get_safe_system_limit(
             r.get("road_class_norm", "unknown"),
             r.get("land_use", "unknown"),
-            r.get("osm_oneway")  if has_osm      else None,
-            r.get("osm_lanes")   if has_osm      else None,
-            r.get("sinuosity")   if has_sinuosity else 1.0,
+            r.get("osm_oneway")            if has_osm       else None,
+            r.get("osm_lanes")             if has_osm       else None,
+            r.get("sinuosity")             if has_sinuosity else 1.0,
+            r.get("osm_surface")           if has_surface   else None,
+            r.get("osm_lit")               if has_lit       else None,
+            r.get("ghsl_settlement_class") if has_ghsl      else None,
         ),
         axis=1,
     )
+    if has_ghsl:
+        n_ghsl = gdf["ghsl_settlement_class"].notna().sum()
+        log.info(f"  SS limit uses GHSL settlement class for {n_ghsl:,} segments")
+    if has_surface:
+        n_unpaved = gdf["osm_surface"].isin(_UNPAVED_SURFACES).sum()
+        if n_unpaved:
+            log.info(f"  SS limit reduced for unpaved surface on {n_unpaved:,} segments")
     if has_sinuosity:
         n_adj = (gdf["sinuosity"] >= 1.20).sum()
         if n_adj:
-            print(f"  SS limit adjusted for sinuosity on {n_adj:,} curved segments")
+            log.info(f"  SS limit adjusted for sinuosity on {n_adj:,} curved segments")
     return gdf
 
 
@@ -145,55 +232,104 @@ def score_speed_limit_alignment(posted: pd.Series, ss_limit: pd.Series) -> pd.Se
     return np.clip(gap_pct / 0.50, 0, 1).fillna(0) * 100
 
 
-def score_limit_credibility_gap(speed_85th: pd.Series, speed_limit: pd.Series) -> pd.Series:
+def score_limit_credibility_gap(
+    speed_85th: pd.Series,
+    speed_limit: pd.Series,
+    osm_lanes: pd.Series = None,
+    osm_surface: pd.Series = None,
+    ghsl_settlement_class: pd.Series = None,
+) -> pd.Series:
     """
-    REFRAMED (was score_operating_speed_gap). This is NOT a measure of
-    "how much drivers speed" — it is evidence about whether the POSTED
-    LIMIT matches how the road is actually used. A large gap means the
-    limit has likely lost credibility and needs review, not that
+    Evidence that the posted limit does not match how the road is used.
+
+    REFRAMED: this is NOT "how much do drivers speed." It is evidence about
+    whether the POSTED LIMIT is appropriate for the road. A large gap means
+    the limit has likely lost credibility and needs review — not that
     enforcement needs to increase.
 
-    Uses the SAME absolute km/h gap and thresholds as
-    advanced_scoring.credibility() (10/20 km/h — CREDIBILITY_GAP_CREDIBLE /
-    CREDIBILITY_GAP_NONCREDIBLE in config.py), so this sub-score and that
-    module's classification report one consistent number instead of two
-    different formulas for nearly the same underlying evidence.
+    ROAD-QUALITY DAMPENER (new): on well-built rural roads (4+ lanes, paved,
+    low-density settlement), a high F85 gap more plausibly indicates the
+    posted limit is SET TOO LOW for the road's design rather than that drivers
+    are recklessly speeding. Per the ADB FAQ: "concluding that a road needs a
+    lower speed limit simply because F85 is high could be dangerous if the road
+    design is meant for higher speeds." The dampener halves the penalty in that
+    specific combination — it does NOT apply in urban/suburban or unpaved settings.
 
     gap <= 10 km/h ("Credible")     → 0
-    gap >= 20 km/h ("Non-Credible") → 100
-    Under-speed (negative gap) is NOT penalised here — it has a different
-    likely cause (poor road condition, heavy trucks) and a different
-    intervention; see advanced_scoring.credibility_class for that case.
-
-    Example: F85=103 on 80km/h posted → 23 km/h gap → score=100 (capped)
-    Example: F85=85 on 80km/h posted  → 5 km/h gap  → score=0
+    gap >= 20 km/h ("Non-Credible") → 100 (or 50 if road-quality dampener active)
     """
-    gap = (speed_85th - speed_limit).clip(lower=0)
+    gap  = (speed_85th - speed_limit).clip(lower=0)
     span = CREDIBILITY_GAP_NONCREDIBLE - CREDIBILITY_GAP_CREDIBLE
-    return np.clip((gap - CREDIBILITY_GAP_CREDIBLE) / span, 0, 1).fillna(0) * 100
+    raw  = np.clip((gap - CREDIBILITY_GAP_CREDIBLE) / span, 0, 1).fillna(0) * 100
+
+    # Road-quality dampener — only when all three signals point to "high quality rural"
+    if osm_lanes is not None or osm_surface is not None or ghsl_settlement_class is not None:
+        rural_classes = {"low_density_rural", "very_low_density_rural"}
+        is_hq_rural = pd.Series(True, index=raw.index)
+
+        if osm_lanes is not None:
+            is_hq_rural &= osm_lanes.fillna(0) >= 4
+        if osm_surface is not None:
+            is_hq_rural &= ~osm_surface.fillna("").isin(_UNPAVED_SURFACES)
+        if ghsl_settlement_class is not None:
+            is_hq_rural &= ghsl_settlement_class.isin(rural_classes)
+        else:
+            # Without GHSL we can't confirm "rural" — don't apply dampener
+            is_hq_rural &= False
+
+        raw = raw * np.where(is_hq_rural, 0.5, 1.0)
+
+    return raw
 
 
 def score_vru_context_risk(gdf: gpd.GeoDataFrame) -> pd.Series:
     """
-    VRU exposure: land use + road class + urban density + helmet SPI.
+    VRU exposure: settlement context + road class + urban density + helmet SPI.
+
+    GHSL UPGRADE: when ghsl_settlement_class is present, the binary
+    urban=80/rural=35 base score is replaced with a 7-level score that
+    distinguishes urban centres (80) from rural clusters (50) from truly
+    isolated rural roads (28). This directly fixes the FAQ-flagged limitation
+    that "LandUse may not reflect recent urban development."
+
+    OSM HIGHWAY TAG: residential/living_street roads get a pedestrian-mixing
+    boost (+10) regardless of settlement class — these road types legally share
+    the carriageway with pedestrians and cyclists by definition.
 
     Helmet multiplier kept: crash lethality at any speed is higher without
-    a helmet. MH (SPI=0.148) gets ~31% VRU amplification vs TH (SPI=0.672)
-    at ~9%. Net effect on final SSS: ~2-4 pts — small but directionally correct.
-
-    Rural base = 35 (raised from 30): undivided rural highways in Asia carry
-    significant pedestrian and PTW traffic with no separation.
+    a helmet. Net effect on final SSS: ~2-4 pts — small but directionally correct.
     """
-    lu = gdf.get("land_use", pd.Series([np.nan] * len(gdf), index=gdf.index)).fillna("unknown")
-    rc = gdf.get("road_class_norm", pd.Series([np.nan] * len(gdf), index=gdf.index)).fillna("unknown")
-    up = gdf.get("urban_pct", pd.Series([np.nan] * len(gdf), index=gdf.index))
-    cc = gdf.get("country_code", pd.Series([np.nan] * len(gdf), index=gdf.index)).fillna("unknown")
+    lu   = gdf.get("land_use",        pd.Series([np.nan]*len(gdf), index=gdf.index)).fillna("unknown")
+    rc   = gdf.get("road_class_norm", pd.Series([np.nan]*len(gdf), index=gdf.index)).fillna("unknown")
+    up   = gdf.get("urban_pct",       pd.Series([np.nan]*len(gdf), index=gdf.index))
+    cc   = gdf.get("country_code",    pd.Series([np.nan]*len(gdf), index=gdf.index)).fillna("unknown")
+    ghsl = gdf.get("ghsl_settlement_class", None)
+    hw   = gdf.get("osm_highway",     pd.Series([""] * len(gdf), index=gdf.index)).fillna("")
 
-    lu_score_map = {"urban": 80, "rural": 35, "unknown": 50}
+    # Land-use base score: GHSL 7-level if available, binary fallback otherwise
+    if ghsl is not None and ghsl.notna().any():
+        lu_score = ghsl.map(_GHSL_VRU_BASE).fillna(
+            lu.map({"urban": 80, "rural": 35, "unknown": 50}).fillna(50)
+        )
+    else:
+        lu_score = lu.map({"urban": 80, "rural": 35, "unknown": 50}).fillna(50)
 
-    lu_score = lu.map(lu_score_map).fillna(50)
     rc_score = rc.map(VRU_RC_SCORE_MAP).fillna(50)
     base = 0.60 * lu_score + 0.40 * rc_score
+
+    # OSM highway tag: residential/living_street → pedestrian-mixing boost
+    pedestrian_road = hw.isin({"residential", "living_street", "unclassified"})
+    base = (base + pedestrian_road.astype(float) * 10).clip(0, 100)
+
+    # OSM lighting: unlit roads outside urban centres → higher pedestrian casualty
+    # risk at night. iRAP star-rating explicitly includes lighting as a VRU factor;
+    # NHTSA data: ~25% of pedestrian fatalities on inadequately lit roads.
+    # Only applied outside urban_centre/dense_urban where street lighting is assumed.
+    osm_lit_col = gdf.get("osm_lit", pd.Series([""] * len(gdf), index=gdf.index)).fillna("")
+    is_urban_core = (ghsl.isin({"urban_centre", "dense_urban"}) if ghsl is not None and ghsl.notna().any()
+                     else lu == "urban")
+    unlit_penalty = osm_lit_col.eq("no") & ~is_urban_core
+    base = (base + unlit_penalty.astype(float) * 8).clip(0, 100)
 
     if up.notna().any():
         up_norm = up.clip(0, 100) / 100
@@ -245,7 +381,11 @@ def compute_speed_safety_score(
         gdf.loc[mask, "speed_limit"], gdf.loc[mask, "ss_limit"]
     )
     gdf.loc[mask, "sub_score_limit_credibility"] = score_limit_credibility_gap(
-        gdf.loc[mask, "speed_85th"], gdf.loc[mask, "speed_limit"]
+        gdf.loc[mask, "speed_85th"],
+        gdf.loc[mask, "speed_limit"],
+        osm_lanes             = gdf.loc[mask, "osm_lanes"]             if "osm_lanes"             in gdf.columns else None,
+        osm_surface           = gdf.loc[mask, "osm_surface"]           if "osm_surface"           in gdf.columns else None,
+        ghsl_settlement_class = gdf.loc[mask, "ghsl_settlement_class"] if "ghsl_settlement_class" in gdf.columns else None,
     )
     gdf.loc[mask, "sub_score_vru_risk"] = score_vru_context_risk(gdf[mask])
 
@@ -272,7 +412,7 @@ def compute_speed_safety_score(
         gdf.loc[mask, "sss_raw"] * gdf.loc[mask, "confidence_weight"]
     ).clip(0, 100)
 
-    gdf.loc[mask, "sss_band"] = gdf.loc[mask, "sss"].apply(_classify_band)
+    gdf.loc[mask, "sss_band"] = gdf.loc[mask, "sss"].apply(classify_band)
     gdf["low_data_flag"] = (
         gdf["sample_size"].fillna(0) < MIN_SAMPLE_SIZE
     ) & gdf["scoreable"]
@@ -280,10 +420,10 @@ def compute_speed_safety_score(
         _generate_recommendation, axis=1
     )
 
-    print("\nSSS computed. Score distribution:")
-    print(gdf.loc[mask, "sss"].describe().round(1))
-    print("\nBand distribution:")
-    print(gdf.loc[mask, "sss_band"].value_counts())
+    log.info("\nSSS computed. Score distribution:")
+    log.info(gdf.loc[mask, "sss"].describe().round(1).to_string())
+    log.info("\nBand distribution:")
+    log.info(gdf.loc[mask, "sss_band"].value_counts().to_string())
     return gdf
 
 
@@ -307,11 +447,11 @@ def compute_alignment_only_score(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     gdf.loc[mask, "alignment_only_score"] = score_speed_limit_alignment(
         gdf.loc[mask, "speed_limit"], gdf.loc[mask, "ss_limit"]
     )
-    gdf.loc[mask, "alignment_only_band"] = gdf.loc[mask, "alignment_only_score"].apply(_classify_band)
+    gdf.loc[mask, "alignment_only_band"] = gdf.loc[mask, "alignment_only_score"].apply(classify_band)
     return gdf
 
 
-def _classify_band(score: float) -> str:
+def classify_band(score: float) -> str:
     if pd.isna(score):
         return "No Data"
     for band, (lo, hi) in SCORE_BANDS.items():

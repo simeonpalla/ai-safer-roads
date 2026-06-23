@@ -20,7 +20,8 @@
 12. [Validation — No Crash Data Required](#12-validation--no-crash-data-required)
 13. [Outputs](#13-outputs)
 14. [Key Results](#14-key-results)
-15. [Limitations & Honest Gaps](#15-limitations--honest-gaps)
+15. [Scalability — Deploying in a New Country](#15-scalability--deploying-in-a-new-country)
+16. [Limitations & Honest Gaps](#16-limitations--honest-gaps)
 
 ---
 
@@ -121,6 +122,9 @@ graph TD
     C["HOTOSM Facilities<br/>schools and hospitals<br/>Humanitarian OpenStreetMap Team"] --> M
     D["VIIRS 2025<br/>nighttime lights annual composite<br/>NASA Black Marble"] --> M
     E["OSM Road Infrastructure<br/>surface, lighting, lanes<br/>OpenStreetMap contributors"] --> M
+    F["GHSL SMOD 2025<br/>7-level settlement classification<br/>EU Joint Research Centre"] --> M
+    G["OSM Points of Interest<br/>markets, transit hubs, religious sites,<br/>universities, railway crossings"] --> M
+    H["Mapillary v4 API<br/>street-level traffic signs + road objects<br/>Meta / community imagery"] --> M
     M --> P["Full feature matrix<br/>for scoring and ML"]
 ```
 
@@ -139,6 +143,28 @@ NASA's VIIRS satellite captures surface brightness at night. The 2025 annual com
 ### OSM Road Infrastructure
 
 OpenStreetMap's road tags include surface type (paved / unpaved / gravel), presence of lighting, and lane count. These tell us about road condition beyond just functional class. A secondary road without lighting, on unpaved surface, is more dangerous than a secondary road with full infrastructure. **71.3% of segments have real-world OSM attributes; the remainder use class-level defaults.**
+
+### GHSL SMOD 2025 — Settlement Classification
+
+The EU Joint Research Centre's Global Human Settlement Layer provides a 7-level settlement classification raster at 1 km² resolution. Levels range from `dense_urban` through `urban_centre`, `semi_dense_urban`, `suburban`, `rural_cluster`, `low_density_rural`, to `very_low_density_rural`. This continuous urbanicity scale — rather than the binary URBAN/RURAL field in the ADB data — feeds the Safe System threshold logic and the XGBoost feature matrix as a numeric input. **55,146 segments** were reclassified relative to the original binary field, particularly peri-urban corridors that sit between clear urban and rural definitions.
+
+### OSM Points of Interest — Extended VRU Attractors
+
+Beyond schools and hospitals, we added five more POI types from OpenStreetMap that concentrate pedestrian and two-wheeler activity:
+
+| POI Type | Buffer | Count (MH + TH) | Rationale |
+|---|---|---|---|
+| Markets / bazaars | 400 m | 7,651 | Dense pedestrian–vehicle mixing zones |
+| Transit hubs (rail/bus stations) | 300 m | 5,036 | Arrival/departure pedestrian peaks |
+| Religious sites | 400 m | 44,404 | Periodic high foot-traffic events |
+| Universities / colleges | 500 m | 3,588 | Young pedestrian and two-wheeler concentration |
+| Railway level crossings | 200 m | 9,197 | Train–road conflict point; 881 road segments within 200 m |
+
+A composite column `dist_to_nearest_vru_attractor_m` captures the minimum distance across all seven POI types and enters the XGBoost model.
+
+### Mapillary v4 — Street-Level Infrastructure
+
+We queried the Mapillary Map Features API across a 0.01°×0.01° grid covering all Critical and High Risk segments (5,800 segments → 3,919 unique grid cells, 2,219 newly queried). Results: **12,625 segments** received coverage data. **2,710 Critical/High Risk segments** had zero street-level imagery — flagged as *infrastructure blindspots* on the interactive map. Mean infrastructure visibility score on covered segments: **89.5 / 100**.
 
 ---
 
@@ -188,13 +214,13 @@ This is the core empirical validation of the methodology: SSS and PercentOverLim
 
 ```mermaid
 graph TD
-    A["Load GeoJSONs<br/>Thailand 55,884 segs + Maharashtra 14,082 segs"] --> B["Geometry and Feature Engineering<br/>segment length, intersection density, urban flag, road class mapping"]
+    A["Load GeoJSONs<br/>Thailand 55,884 segs + Maharashtra 14,082 segs"] --> B["Geometry and Feature Engineering<br/>sinuosity, GHSL settlement class, road class mapping"]
     B --> C{Has valid GPS probe data?}
     C -->|Yes - 14711 segments| D["Tier 2: Direct Scoring<br/>compute all 3 sub-scores from measurements"]
     C -->|No - 55255 segments| E["ML Extension Path<br/>predict from road features"]
-    D --> F["Merge enrichment layers<br/>VIIRS, WorldPop, HOTOSM, OSM infra"]
-    E --> G["XGBoost trained on Tier 2<br/>5-fold CV, RMSE=8.0, R2=0.817"]
-    G --> H["Predict SSS for 45183 segments<br/>12072 excluded - insufficient features"]
+    D --> F["Merge enrichment layers<br/>VIIRS, WorldPop, HOTOSM, 7 POI types, OSM infra, Mapillary"]
+    E --> G["XGBoost trained on Tier 2<br/>5-fold CV, RMSE=6.06, R²=0.877"]
+    G --> H["Predict SSS for 45,183 unscored segments"]
     H --> F
     F --> I["Speed Safety Score 0-100<br/>+ score band assignment"]
     I --> J["Priority Index<br/>Exposure x Likelihood x Severity"]
@@ -426,10 +452,10 @@ XGBoost (Extreme Gradient Boosting) was chosen for four reasons:
 
 ```mermaid
 graph TD
-    A["Tier 2 labeled dataset<br/>14,711 segments with real SSS scores"] --> B["Feature matrix construction<br/>RoadClass, LandUse, SegmentLength,<br/>IntersectionDensity, PopDensity,<br/>FacilityProximity, OSMInfraScore,<br/>VIIRSFlag, Country"]
+    A["Tier 2 labeled dataset<br/>14,711 segments with real SSS scores"] --> B["Feature matrix construction<br/>RoadClass, LandUse, Sinuosity,<br/>GHSL settlement code + class,<br/>PopDensity, dist_to_nearest_vru_attractor,<br/>VIIRS NTL score, Mapillary infra score"]
     B --> C["5-fold cross-validation<br/>split dataset into 5 equal folds<br/>train on 4, validate on 1<br/>repeat 5 times"]
     C --> D["Out-of-fold predictions<br/>each segment scored exactly once<br/>on data the model never saw"]
-    D --> E["Validation metrics<br/>RMSE = 8.0 on 0-100 scale<br/>R-squared = 0.817"]
+    D --> E["Validation metrics<br/>RMSE = 6.06 on 0-100 scale<br/>R-squared = 0.877"]
     E --> F{"Acceptable performance?"}
     F -->|Yes| G["Train final model on all 14,711 segments"]
     F -->|No| H["Tune hyperparameters and retrain"]
@@ -442,14 +468,16 @@ After training, we ran SHAP (SHapley Additive exPlanations) on the full training
 
 | Rank | Feature | Mean \|SHAP\| | Category |
 |---|---|---|---|
-| 1 | Land Use: Rural | 6.91 | Road context |
-| 2 | Limit Credibility Gap | 4.85 | Speed / limit |
-| 3 | Posted Speed Limit | 4.33 | Speed / limit |
-| 4 | Safe System Speed Limit | 4.14 | Speed / limit |
-| 5 | Nilsson Fatal Risk Ratio | 3.92 | Risk / severity |
-| 6 | Road Class: Secondary | 0.93 | Road type |
-| 7 | Land Use: Urban | 0.89 | Road context |
-| 8–10 | Road Class: Trunk / Primary / Motorway | < 0.32 | Road type |
+| 1 | Safe System Speed Limit | 8.38 | Speed / limit |
+| 2 | Posted Speed Limit | 5.91 | Speed / limit |
+| 3 | GHSL Settlement Code (urbanicity) | 4.72 | Context |
+| 4 | Limit Credibility Gap | 4.31 | Speed / limit |
+| 5 | VIIRS NTL Exposure Score | 3.18 | Nighttime exposure |
+| 6 | dist_to_nearest_vru_attractor_m | 2.74 | VRU proximity |
+| 7 | Sinuosity | 1.96 | Geometry |
+| 8 | Road Class: Secondary | 0.89 | Road type |
+| 9 | Land Use: Urban | 0.74 | Road context |
+| 10 | Mapillary infra_visibility_score | 0.52 | Street-level infra |
 
 **What this tells us:**
 
@@ -462,9 +490,9 @@ The SHAP results confirm the model learned a defensible representation of road d
 
 ### Interpreting the Validation Metrics
 
-**RMSE = 8.0** on a 0–100 scale means the model's predictions are, on average, 8 points away from the true score. To contextualise: the score band boundaries are 13 points apart (Critical ≥65, High Risk ≥52). An 8-point average error means the model will occasionally misclassify a segment near a band boundary — a High Risk segment at 53 might be predicted as Moderate at 45. However, it will rarely confuse Critical with Acceptable.
+**RMSE = 6.06** on a 0–100 scale means the model's predictions are, on average, 6 points away from the true score. The score band boundaries are 13 points apart (Critical ≥65, High Risk ≥52). A 6-point average error means the model will occasionally misclassify a segment near a band boundary — a High Risk segment at 53 might be predicted as Moderate at 47. It will rarely confuse Critical with Acceptable.
 
-**R² = 0.817** means the model explains 81.7% of the variance in SSS scores using only road network features. This is strong for a model with no speed measurement input — it means road class, population density, and land use together are highly informative about limit appropriateness.
+**R² = 0.877** means the model explains 87.7% of the variance in SSS scores using road network and enrichment features. The improvement from the baseline (R²=0.817, RMSE=8.0) was driven primarily by adding GHSL settlement classification (replaces binary URBAN/RURAL), VIIRS NTL score, sinuosity, and the composite VRU attractor distance. Together these features provide the model with a continuous urbanicity gradient and nighttime exposure signal it previously lacked.
 
 ---
 
@@ -548,7 +576,7 @@ graph TD
     P --> V4
     V1["Check 1: Weight Sensitivity<br/>Perturb each weight plus or minus 10 pct<br/>Recompute all scores<br/>Measure rank correlation"] --> R1["Spearman r >= 0.95<br/>Rankings are stable"]
     V2["Check 2: Entropy Weight Comparison<br/>Independent data-driven weights<br/>via Shannon entropy method<br/>Compare top-20 segment lists"] --> R2["Top-20 overlap: 19 of 20<br/>Extreme cases robust across methods"]
-    V3["Check 3: XGBoost Cross-Validation<br/>5-fold CV on Tier 2 dataset<br/>Out-of-fold predictions vs true scores"] --> R3["RMSE=8.0, R2=0.817<br/>ML extension is reliable"]
+    V3["Check 3: XGBoost Cross-Validation<br/>5-fold CV on Tier 2 dataset<br/>Out-of-fold predictions vs true scores"] --> R3["RMSE=6.06, R2=0.877<br/>ML extension is reliable"]
     V4["Check 4: Face Validity<br/>Manual review of top Critical segments<br/>Do they match known dangerous archetypes?"] --> R4["Top segments are TH urban arterials<br/>80-90 km/h posted, F85 100-115 km/h<br/>Known dangerous road types recovered"]
 ```
 
@@ -558,7 +586,7 @@ graph TD
 
 **Check 2** proves that the most extreme cases — the top-20 most dangerous segments — are identified robustly regardless of whether you use our engineering weights or a purely data-driven alternative. This is the most important robustness test: if the top-20 were entirely different under different methods, the ranking would be meaningless.
 
-**Check 3** proves the ML extension is reliable enough to produce meaningful band assignments. An RMSE of 8 on a 0–100 scale with band boundaries 13 points apart means band misclassification is concentrated at boundary zones, not across-the-board.
+**Check 3** proves the ML extension is reliable enough to produce meaningful band assignments. An RMSE of 6.1 on a 0–100 scale with band boundaries 13 points apart means band misclassification is concentrated at boundary zones, not across-the-board.
 
 **Check 4** proves the model has not learned something nonsensical. The segments the model identifies as most dangerous are Thailand urban arterials — primary and secondary roads in urban land use, posted at 80–90 km/h, with F85 at 100–115 km/h. These are exactly the roads you would expect a transport engineer to flag as dangerous. The model recovered this finding from data alone, without knowing about any prior dangerous-road designations.
 
@@ -588,13 +616,17 @@ Population density and NTL do not increase monotonically at Critical, and this i
 | File | Format | Contents |
 |---|---|---|
 | `speed_safety_scores.csv` | CSV | All 14,711 Tier 2 segments with SSS, sub-scores, Priority Index |
-| `speed_safety_scores_all.gpkg` | GeoPackage | All 59,894 scored segments with full geometry — ArcGIS-compatible |
-| `Top_Priority_Interventions.xlsx` | Excel (6 sheets) | 6,008 priority segments (833 Critical + 5,175 High Risk) |
-| `speed_safety_map.html` | Leaflet HTML | Interactive map with all layers, Street View links, toggles |
-| `ml_validation_scatter.png` | PNG | XGBoost OOF scatter: predicted vs actual SSS |
+| `speed_safety_scores_all.gpkg` | GeoPackage | All 14,711 scored segments with full geometry — ArcGIS-compatible |
+| `Top_Priority_Interventions.xlsx` | Excel (6 sheets) | 5,800 priority segments (679 Critical + 5,121 High Risk) |
+| `speed_safety_map.html` | Leaflet HTML | Interactive map with all layers, Street View links, Mapillary blindspot layer |
+| `ml_coverage_extension.gpkg` | GeoPackage | XGBoost-predicted SSS for 45,183 unscored segments |
+| `ml_coverage_extension.csv` | CSV | Flat CSV of ML-extended predictions |
+| `speed_safety_corridors.gpkg` | GeoPackage | 309 high-risk intervention zones |
+| `ml_validation_scatter.png` | PNG | XGBoost OOF scatter: predicted vs actual SSS (R²=0.877) |
 | `score_overview.png` | PNG | Band distribution summary chart |
-| `ml_shap_importance.png` | PNG | SHAP feature importance bar chart (top 10 features by mean \|SHAP\|) |
-| `scatter_sss_vs_pct_over_limit.png` | PNG | SSS vs % over limit scatter — 4-quadrant Hidden Danger analysis |
+| `ml_shap_importance.png` | PNG | SHAP feature importance bar chart (top 10 by mean \|SHAP\|) |
+| `scatter_sss_vs_pct_over_limit.png` | PNG | SSS vs % over limit — 4-quadrant Hidden Danger analysis |
+| `ai_anomaly_segments.csv` | CSV | Isolation Forest anomalous segments (experimental) |
 
 ### Policy Brief Structure
 
@@ -603,7 +635,7 @@ The Excel policy brief is designed for government road safety departments, not d
 | Sheet | Who uses it | What they do |
 |---|---|---|
 | Executive Summary | Minister / department head | Read the headline findings |
-| Critical Segments | Road agency engineers | Select the 833 segments for immediate review |
+| Critical Segments | Road agency engineers | Select the 679 segments for immediate review |
 | High Risk Segments | Planning teams | Build 3–5 year intervention programme |
 | Summary by Road Class | Policy analysts | Identify systemic issues (e.g. "all secondary urban roads are High Risk") |
 | Intervention Zones | Field teams | Identify geographic clusters for efficient inspection tours |
@@ -629,20 +661,24 @@ This tells a field engineer exactly which government body owns the road and is r
 | Total road segments (Thailand + Maharashtra) | 69,966 |
 | Segments with valid GPS probe data (Tier 2) | 14,711 (21%) |
 | Segments scored via ML extension | 45,183 |
-| Total scored segments | 59,894 |
-| Critical band — Tier 2 | 833 (5.5%) |
-| High Risk band — Tier 2 | 5,175 (32.6%) |
-| Moderate band — Tier 2 | 4,369 (29.7%) |
-| Acceptable band — Tier 2 | 4,334 (32.2%) |
-| Critical band — ML-extended | 8.2% |
-| High Risk band — ML-extended | 71.8% |
+| Critical band — Tier 2 | 679 (4.6%) |
+| High Risk band — Tier 2 | 5,121 (34.8%) |
+| Moderate band — Tier 2 | 3,790 (25.8%) |
+| Acceptable band — Tier 2 | 5,121 (34.8%) |
+| Critical band — ML-extended | 0.1% |
+| High Risk band — ML-extended | 44.3% |
 | VIIRS high-NTL hotspots | 5,487 (7.8%) |
-| Priority segments in policy brief | 6,008 |
-| XGBoost RMSE / R² | 8.0 / 0.817 |
-| SHAP top driver | Land Use: Rural (mean \|SHAP\| = 6.91) |
+| Mapillary segments covered | 12,625 |
+| Mapillary high-risk blindspots (SSS≥50, no imagery) | 2,710 |
+| Priority segments in policy brief | 5,800 |
+| XGBoost RMSE / R² | 6.06 / 0.877 |
+| SHAP top driver | Safe System Speed Limit (mean \|SHAP\| = 8.38) |
 | Weight sensitivity (Spearman r) | ≥ 0.95 |
-| Hidden Danger segments (SSS ≥ 45, % over limit < 40%) | 5,021 (34.1% of Tier 2) |
-| High-risk roads missed by % over limit monitoring | 73% |
+| Hidden Danger segments (SSS ≥ 45, % over limit < 40%) | 5,162 (35.1% of Tier 2) |
+| High-risk roads missed by % over limit monitoring | 75% |
+| Segments needing limit reduction | 7,459 (avg. −21.8 km/h) |
+| Est. annual lives saved if limits corrected (central) | 160.9 (range 80–322) |
+| High-risk intervention zones | 309 zones, 5,980 segments |
 
 ### The Finding That Matters Most
 
@@ -650,7 +686,79 @@ Traffic-volume ranking systematically misses dangerous roads where risk comes fr
 
 ---
 
-## 15. Limitations & Honest Gaps
+## 15. Scalability — Deploying in a New Country
+
+### What the Pipeline Actually Requires
+
+The framework was designed from the start with replicability in mind. Every data source used is either provided by ADB or freely available globally. There are no proprietary datasets, no country-specific calibration parameters, and no steps that require local institutional knowledge to execute.
+
+**Minimum viable inputs for any new country:**
+
+| Input | Source | Required? |
+|---|---|---|
+| Road network with geometry | OpenStreetMap (Geofabrik download) | Yes |
+| Posted speed limits | OSM `maxspeed` tag or national road authority | Yes — or can be estimated by road class |
+| GPS probe speed data (F85, MedianSpeed) | National transport authority, Mapillary, or HERE | Recommended for Tier 2 scoring |
+| Population density raster | WorldPop (global, free, 100m resolution) | Yes — auto-downloaded |
+| Schools / hospitals | HOTOSM (global, free) | Yes — auto-downloaded |
+| Nighttime lights raster | NASA VIIRS (global, free, annual composite) | Recommended |
+| Helmet wearing rates | WHO / national SPI reports | Soft requirement — defaults available |
+
+### What Happens with Limited GPS Coverage
+
+The Thailand dataset had 21% GPS coverage. A new country might have 5% or even less. The pipeline handles this explicitly:
+
+- **Tier 2 (full SSS):** only segments with GPS probe data. In a low-coverage country this might be 1,000–5,000 segments — still useful for the highest-traffic corridors.
+- **Tier 3 (ML extension):** XGBoost trained on Tier 2 segments predicts SSS for the rest of the network using road class, land use, geometry, population density, and facility proximity — all of which come from OSM and WorldPop, available everywhere. In a country with 5% GPS coverage, ~95% of the network still gets a score.
+- **Tier 1 (limit-only):** any segment with a posted speed limit (from OSM or national GIS) can be scored on the Safe System alignment component alone, even without GPS data. This is the floor — a country with no GPS data at all can still produce a limit-appropriateness map.
+
+This tiered degradation is the core scalability mechanism: the framework produces *something useful* at every data level, and upgrades automatically as more data becomes available.
+
+### Onboarding a New Country — 3 Steps
+
+```
+Step 1 — Configure (10 minutes)
+  Edit config.py:
+    COUNTRY_CODE = "VN"                      # new country
+    SAFE_SYSTEM_THRESHOLDS = {...}            # WHO defaults work if unknown
+    HELMET_SPI = {"urban": 0.65, "rural": 0.50}  # from WHO report or default 0.5
+
+Step 2 — Download open data (automated)
+  python extract_osm_data.py --country VN    # pulls schools, hospitals, road infra
+  # WorldPop and VIIRS are fetched at runtime by enrichment.py
+
+Step 3 — Run
+  python main.py --mh <road_network.geojson>
+```
+
+The only manual step is locating the GPS probe data, which in most ADB member countries would come from the national road authority or from commercial probe providers (HERE, TomTom, Mapillary).
+
+### What Does Not Need to Change
+
+- **SSS weights (38/30/32):** grounded in WHO Safe System principles, not in local crash statistics. They transfer directly.
+- **Safe System thresholds:** WHO publishes standard speed thresholds by road type and land use. They apply globally.
+- **Nilsson Power Model:** validated across 30+ countries in peer-reviewed literature (Nilsson 2004, Elvik 2009). Transfers directly.
+- **Intervention logic:** road class × limit misalignment → recommended action. Country-agnostic.
+
+### What Does Need Local Calibration
+
+- **Band thresholds (Critical ≥65, etc.):** these were set on the Thailand and Maharashtra data distributions. A new country with a systematically different speed culture might shift the distribution and require recalibrating where the Critical/High Risk boundaries fall.
+- **VKM conversion constant:** the lives-saved estimate uses a GPS-sample-to-vehicle-km bridge that is currently a calibrated assumption. A country with national traffic count data can replace this with a verified figure.
+- **Helmet SPI:** the VRU severity multiplier uses helmet wearing rates. WHO publishes these for most countries; where unavailable, the default of 50% is conservative.
+
+### Example: Vietnam (illustrative)
+
+Vietnam has high motorcycle density, partially OSM-mapped roads, and national speed limit data available from the NTSC. Running the pipeline on Vietnam would require:
+1. A Vietnam road network GeoJSON (from Geofabrik, ~15 min download)
+2. GPS probe data from NTSC or a commercial provider
+3. Vietnam helmet SPI from WHO 2023 report: urban 55%, rural 42%
+4. One line change in `config.py`
+
+The pipeline would produce a Tier 2 score for monitored corridors and ML-extended Tier 3 scores for the remaining ~80% of the network — within a single day of setup.
+
+---
+
+## 16. Limitations & Honest Gaps
 
 | Limitation | Why it exists | What it means for the results |
 |---|---|---|

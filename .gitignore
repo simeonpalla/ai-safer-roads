@@ -10,4 +10,12 @@ data/
 # Large data files — download separately (see README)
 enrichment_data/road_infra/
 enrichment_data/viirs/
+enrichment_data/worldpop*.tif
+enrichment_data/mapillary_cache/*.tmp
+enrichment_data/ghsl/
+enrichment_data/crossings/
+enrichment_data/markets/
+enrichment_data/religious/
+enrichment_data/transit/
+enrichment_data/university/
 openSourceData/

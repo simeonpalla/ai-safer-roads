@@ -30,8 +30,11 @@ import shap
 
 warnings.filterwarnings("ignore")
 
+from logger import get_logger
 from config import SCORE_BANDS
-from scoring import get_safe_system_limit
+from scoring import get_safe_system_limit, classify_band
+
+log = get_logger(__name__)
 
 NUMERIC_FEATURES = [
     "ss_limit",
@@ -41,8 +44,13 @@ NUMERIC_FEATURES = [
     "pop_density_500m",
     "dist_to_school_m",
     "dist_to_hospital_m",
+    "ghsl_settlement_code",             # 7-level urbanicity score (11–30); NaN handled by XGBoost
+    "ntl_exposure_score",               # VIIRS nighttime light intensity 0–100
+    "sinuosity",                        # road curvature ≥1.0; straight = 1.0
+    "infra_visibility_score",           # Mapillary coverage 0–100
+    "dist_to_nearest_vru_attractor_m",  # min(school, hospital, market, transit) distance
 ]
-CAT_FEATURES = ["road_class_norm", "land_use"]
+CAT_FEATURES = ["road_class_norm", "land_use", "ghsl_settlement_class"]
 
 XGB_PARAMS = dict(
     n_estimators=300,
@@ -55,15 +63,6 @@ XGB_PARAMS = dict(
     n_jobs=-1,
     verbosity=0,
 )
-
-
-def _classify_band(score: float) -> str:
-    if pd.isna(score):
-        return "No Data"
-    for name, (lo, hi) in SCORE_BANDS.items():
-        if lo <= score < hi:
-            return name
-    return "Critical" if score >= max(lo for lo, _ in SCORE_BANDS.values()) else "Acceptable"
 
 
 def _ensure_ss_limit(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
@@ -129,14 +128,14 @@ def run_ml_extension(
     n_train = int(train_mask.sum())
     n_pred  = int(pred_mask.sum())
 
-    print(f"\n{'='*60}")
-    print("  ML COVERAGE EXTENSION -- XGBoost SSS Predictor")
-    print(f"{'='*60}")
-    print(f"  Training (Tier 2 scored):   {n_train:,}")
-    print(f"  Prediction (unscored):      {n_pred:,}")
+    log.info(f"\n{'='*60}")
+    log.info("  ML COVERAGE EXTENSION -- XGBoost SSS Predictor")
+    log.info(f"{'='*60}")
+    log.info(f"  Training (Tier 2 scored):   {n_train:,}")
+    log.info(f"  Prediction (unscored):      {n_pred:,}")
 
     if n_train < 50:
-        print("  Too few training samples -- skipping ML extension")
+        log.warning("  Too few training samples -- skipping ML extension")
         return gdf
 
     # Impute speed_limit for unscored segments using the median posted/ss ratio
@@ -158,8 +157,8 @@ def run_ml_extension(
             gdf.loc[missing_limit, "speed_limit"] = gdf[missing_limit].apply(_impute, axis=1)
             gdf.loc[missing_limit, "_speed_limit_imputed"] = True
             n_imputed = int(missing_limit.sum())
-            print(f"  Imputed speed_limit for {n_imputed:,} unscored segments "
-                  f"(median posted/ss ratio by road class)")
+            log.info(f"  Imputed speed_limit for {n_imputed:,} unscored segments "
+                     f"(median posted/ss ratio by road class)")
 
     X_train, cat_cols = _build_feature_matrix(gdf[train_mask])
     y_train = gdf.loc[train_mask, "sss"].values.astype(float)
@@ -169,18 +168,18 @@ def run_ml_extension(
     oof = np.full(n_train, np.nan)
     fold_models = []
 
-    print(f"\n  5-fold cross-validation...")
+    log.info(f"\n  5-fold cross-validation...")
     for fold, (tr_idx, val_idx) in enumerate(kf.split(X_train), 1):
         m = xgb.XGBRegressor(**XGB_PARAMS)
         m.fit(X_train.iloc[tr_idx], y_train[tr_idx])
         oof[val_idx] = m.predict(X_train.iloc[val_idx])
         fold_models.append(m)
         rmse_fold = float(np.sqrt(np.mean((oof[val_idx] - y_train[val_idx]) ** 2)))
-        print(f"    Fold {fold}: RMSE = {rmse_fold:.2f}")
+        log.info(f"    Fold {fold}: RMSE = {rmse_fold:.2f}")
 
     cv_rmse = float(np.sqrt(np.nanmean((oof - y_train) ** 2)))
     r2 = float(1 - np.nansum((oof - y_train)**2) / np.nansum((y_train - y_train.mean())**2))
-    print(f"  CV RMSE (overall): {cv_rmse:.2f}  (target < 15)   R²={r2:.3f}")
+    log.info(f"  CV RMSE (overall): {cv_rmse:.2f}  (target < 15)   R²={r2:.3f}")
 
     # OOF scatter plot — predicted vs actual SSS for all training segments
     try:
@@ -200,16 +199,16 @@ def run_ml_extension(
         fig.tight_layout()
         fig.savefig(scatter_path, dpi=150)
         plt.close(fig)
-        print(f"  Saved: {scatter_path.name}")
+        log.info(f"  Saved: {scatter_path.name}")
     except Exception as e:
-        print(f"  (Scatter plot skipped: {e})")
+        log.warning(f"  (Scatter plot skipped: {e})")
 
     # Final model trained on all labelled data
     final_model = xgb.XGBRegressor(**XGB_PARAMS)
     final_model.fit(X_train, y_train)
 
     if n_pred == 0:
-        print("  No unscored segments with a posted limit -- nothing to predict")
+        log.warning("  No unscored segments with a posted limit -- nothing to predict")
         return gdf
 
     X_pred, _ = _build_feature_matrix(gdf[pred_mask], cat_dummy_cols=cat_cols)
@@ -220,7 +219,7 @@ def run_ml_extension(
     ml_conf     = fold_preds.std(axis=1)
 
     # SHAP — TreeExplainer, top-driving feature per segment
-    print(f"  Computing SHAP values ({n_pred:,} segments)...")
+    log.info(f"  Computing SHAP values ({n_pred:,} segments)...")
     explainer   = shap.TreeExplainer(final_model)
     explanation = explainer(X_pred)
     sv          = explanation.values          # (n_pred, n_features)
@@ -230,15 +229,15 @@ def run_ml_extension(
 
     # Write back to gdf
     gdf.loc[pred_mask, "ml_predicted_sss"]   = ml_pred
-    gdf.loc[pred_mask, "ml_predicted_band"]  = [_classify_band(s) for s in ml_pred]
+    gdf.loc[pred_mask, "ml_predicted_band"]  = [classify_band(s) for s in ml_pred]
     gdf.loc[pred_mask, "ml_shap_top_feature"]= ml_shap_top
     gdf.loc[pred_mask, "ml_confidence"]      = ml_conf
 
-    pred_bands = pd.Series([_classify_band(s) for s in ml_pred])
-    print(f"\n  ML-predicted band distribution ({n_pred:,} unscored segments):")
+    pred_bands = pd.Series([classify_band(s) for s in ml_pred])
+    log.info(f"\n  ML-predicted band distribution ({n_pred:,} unscored segments):")
     for band in ["Critical", "High Risk", "Moderate", "Acceptable"]:
         c = (pred_bands == band).sum()
-        print(f"    {band:12s}  {c:5,}  ({100*c/n_pred:.1f}%)")
+        log.info(f"    {band:12s}  {c:5,}  ({100*c/n_pred:.1f}%)")
 
     # Export
     export_cols = [c for c in [
@@ -255,8 +254,8 @@ def run_ml_extension(
     ml_gdf.to_file(out_gpkg, driver="GPKG")
     ml_gdf.drop(columns="geometry", errors="ignore").to_csv(out_csv, index=False)
 
-    print(f"\n  Saved: {out_gpkg.name}  ({len(ml_gdf):,} segments)")
-    print(f"  Saved: {out_csv.name}")
-    print(f"{'='*60}")
+    log.info(f"\n  Saved: {out_gpkg.name}  ({len(ml_gdf):,} segments)")
+    log.info(f"  Saved: {out_csv.name}")
+    log.info(f"{'='*60}")
 
     return gdf

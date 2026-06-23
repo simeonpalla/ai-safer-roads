@@ -184,15 +184,21 @@ def enrich_with_mapillary(
     token: str = None,
     cache_dir: str = "enrichment_data/mapillary_cache",
     delay_s: float = 0.03,
-    max_segments: int = None,
+    segment_mask: "pd.Series | None" = None,
+    max_new_queries: int = None,
 ) -> gpd.GeoDataFrame:
     """
     Enrich road segments with Mapillary infrastructure features.
 
-    Uses a grid-based query strategy: divides the study area into 0.09°×0.09°
-    cells (~10 km), queries each unique cell once, then assigns coverage to all
-    segments whose midpoint falls in that cell. This reduces 14,711 individual
-    API calls to ~200–600 unique grid cells.
+    Uses a grid-based query strategy: divides the study area into 0.01°×0.01°
+    cells (~1 km), queries each unique cell once, then assigns coverage to all
+    segments whose midpoint falls in that cell.
+
+    segment_mask — optional boolean Series aligned to gdf.index.  When provided,
+        only grid cells containing True-masked segments are queried (targeted mode:
+        e.g. Critical + High Risk bands only).  Coverage results are still written
+        to ALL segments that share a queried cell, not just the masked ones.
+        Pass None to query cells for every segment (full-dataset mode).
 
     Columns added:
       mapillary_covered         — True if any features found in grid cell
@@ -244,20 +250,25 @@ def enrich_with_mapillary(
     gdf["_grid_lon"] = (midx / _GRID_DEG).astype(int) * _GRID_DEG
     gdf["_grid_lat"] = (midy / _GRID_DEG).astype(int) * _GRID_DEG
 
-    # Filter to scored segments if max_segments set
-    work_mask = pd.Series(True, index=gdf.index)
-    if max_segments is not None:
-        work_mask = pd.Series(False, index=gdf.index)
-        work_mask.iloc[:max_segments] = True
+    # Determine which grid cells to query
+    if segment_mask is not None:
+        work_mask = segment_mask.reindex(gdf.index, fill_value=False)
+        n_target = work_mask.sum()
+        print(f"  Targeted mode: querying cells for {n_target:,} priority segments")
+    else:
+        work_mask = pd.Series(True, index=gdf.index)
 
     unique_cells = gdf.loc[work_mask, ["_grid_lon","_grid_lat"]].drop_duplicates()
     n_new = sum(1 for _, r in unique_cells.iterrows()
                 if f"{r['_grid_lon']:.3f},{r['_grid_lat']:.3f}" not in grid_cache)
+    n_will_query = min(n_new, max_new_queries) if max_new_queries is not None else n_new
     print(f"\n  Grid cells: {len(unique_cells):,} unique  ({len(grid_cache):,} cached, "
-          f"{n_new:,} new to query)")
+          f"{n_new:,} new)")
     if n_new > 0:
-        print(f"  Est. query time: ~{n_new * (delay_s + 0.4) / 60:.0f} min "
-              f"(rural cells often timeout at {_GRID_DEG}°)")
+        print(f"  Querying {n_will_query:,} new cells "
+              f"(capped at {max_new_queries} per run — re-run to fill remaining {n_new - n_will_query:,})"
+              if max_new_queries and n_new > max_new_queries else
+              f"  Est. query time: ~{n_will_query * (delay_s + 0.4) / 60:.1f} min")
 
     new_queries = 0
     for i, (_, cell) in enumerate(unique_cells.iterrows()):
@@ -269,6 +280,9 @@ def enrich_with_mapillary(
 
         if key in grid_cache:
             continue
+
+        if max_new_queries is not None and new_queries >= max_new_queries:
+            break
 
         features = _query_map_features((west, south, east, north), token, timeout=8)
         n_sign = sum(1 for f in features if f.get("object_type") == "trafficsign")
@@ -371,7 +385,9 @@ def apply_mapillary_to_scoring(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     if "sub_score_limit_credibility" in gdf.columns:
         mask = (vis > 60) & gdf["sub_score_limit_credibility"].notna()
         if mask.any():
-            sign_dens = gdf.loc[mask, "trafficsign_density"].fillna(0)
+            # grid-based enrichment produces mapillary_n_trafficsigns not trafficsign_density
+            tc_col = "trafficsign_density" if "trafficsign_density" in gdf.columns else "mapillary_n_trafficsigns"
+            sign_dens = gdf.loc[mask, tc_col].fillna(0)
             reduction = np.clip(sign_dens / 20, 0, 0.10)  # max 10% reduction
             gdf.loc[mask, "sub_score_limit_credibility"] = (
                 gdf.loc[mask, "sub_score_limit_credibility"] * (1 - reduction)
