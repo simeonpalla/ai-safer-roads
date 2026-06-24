@@ -97,11 +97,15 @@ _UNPAVED_SURFACES = {
     "earth", "laterite", "compacted", "fine_gravel",
 }
 
-# Weights — compliance removed, weight redistributed
+# Weights — v4.0: credibility is now the primary signal (challenge question:
+# "is the posted limit appropriate for this road?"), WHO alignment is the
+# safety floor (25%), VRU is unchanged in intent but slightly upweighted (35%).
+# NOTE: score band thresholds in config.py were calibrated on the old 38/30/32
+# weights; they will need recalibrating after the first run with these weights.
 WEIGHTS = {
-    "speed_limit_alignment": 0.38,
-    "limit_credibility_gap": 0.30,
-    "vru_context_risk":      0.32,
+    "speed_limit_alignment": 0.25,
+    "limit_credibility_gap": 0.40,
+    "vru_context_risk":      0.35,
 }
 
 
@@ -235,6 +239,7 @@ def score_speed_limit_alignment(posted: pd.Series, ss_limit: pd.Series) -> pd.Se
 def score_limit_credibility_gap(
     speed_85th: pd.Series,
     speed_limit: pd.Series,
+    median_speed: pd.Series = None,
     osm_lanes: pd.Series = None,
     osm_surface: pd.Series = None,
     ghsl_settlement_class: pd.Series = None,
@@ -242,30 +247,56 @@ def score_limit_credibility_gap(
     """
     Evidence that the posted limit does not match how the road is used.
 
-    REFRAMED: this is NOT "how much do drivers speed." It is evidence about
-    whether the POSTED LIMIT is appropriate for the road. A large gap means
-    the limit has likely lost credibility and needs review — not that
-    enforcement needs to increase.
+    TWO-DIRECTION SCORING (v4.0):
+    The challenge question is "is the posted limit appropriate for this road?"
+    A large gap in either direction is a signal, but they mean different things:
 
-    ROAD-QUALITY DAMPENER (new): on well-built rural roads (4+ lanes, paved,
-    low-density settlement), a high F85 gap more plausibly indicates the
-    posted limit is SET TOO LOW for the road's design rather than that drivers
-    are recklessly speeding. Per the ADB FAQ: "concluding that a road needs a
-    lower speed limit simply because F85 is high could be dangerous if the road
-    design is meant for higher speeds." The dampener halves the penalty in that
-    specific combination — it does NOT apply in urban/suburban or unpaved settings.
+    OVERPOSTING (limit > F85) — PRIMARY SIGNAL, weight 0.65:
+    Road conditions force drivers below the posted limit. This is a limit DESIGN
+    concern: the road doesn't support its posted number. A limit set above actual
+    road behaviour suggests poor geometry, mixed traffic, unsafe infrastructure,
+    or a context (urban, VRU-heavy) that demands lower speed than posted.
 
-    gap <= 10 km/h ("Credible")     → 0
-    gap >= 20 km/h ("Non-Credible") → 100 (or 50 if road-quality dampener active)
+    Median consensus check: if median_speed is also >5 km/h below the posted
+    limit, both measures agree (consensus = 1.0). If only F85 is below (median
+    is near the limit), the signal is weaker (consensus = 0.6) — possibly just
+    tail congestion rather than a structural limit mismatch.
+
+    UNDERPOSTING (F85 > limit) — SECONDARY SIGNAL, weight 0.35:
+    Drivers naturally travel faster than the limit. Could mean the limit is too
+    conservative for the road's design capacity OR enforcement is weak. Per the
+    ADB FAQ, high F85 alone does not mean the limit should be raised — road
+    design context matters. This is partly an enforcement signal, not purely a
+    limit design concern, hence the lower weight.
+
+    Road-quality dampener (unchanged from v3): on well-built rural roads (4+
+    lanes, paved, low-density settlement), a large F85 excess more plausibly
+    indicates the limit is set too low for the road's design capacity. Halve
+    the underposting penalty in that specific combination only.
+
+    Both directions use the same absolute thresholds (from config):
+      |gap| <= CREDIBILITY_GAP_CREDIBLE (10 km/h)    → score 0
+      |gap| >= CREDIBILITY_GAP_NONCREDIBLE (20 km/h) → score 100
     """
-    gap  = (speed_85th - speed_limit).clip(lower=0)
     span = CREDIBILITY_GAP_NONCREDIBLE - CREDIBILITY_GAP_CREDIBLE
-    raw  = np.clip((gap - CREDIBILITY_GAP_CREDIBLE) / span, 0, 1).fillna(0) * 100
+
+    # --- Signal 1: OVERPOSTING (limit > F85) ---
+    overpost_gap = (speed_limit - speed_85th).clip(lower=0)
+    overpost_raw = np.clip((overpost_gap - CREDIBILITY_GAP_CREDIBLE) / span, 0, 1).fillna(0) * 100
+
+    if median_speed is not None:
+        median_also_low = (speed_limit - median_speed) > 5
+        consensus = np.where(median_also_low, 1.0, 0.6)
+        overpost_raw = overpost_raw * consensus
+
+    # --- Signal 2: UNDERPOSTING (F85 > limit) ---
+    underpost_gap = (speed_85th - speed_limit).clip(lower=0)
+    underpost_raw = np.clip((underpost_gap - CREDIBILITY_GAP_CREDIBLE) / span, 0, 1).fillna(0) * 100
 
     # Road-quality dampener — only when all three signals point to "high quality rural"
     if osm_lanes is not None or osm_surface is not None or ghsl_settlement_class is not None:
         rural_classes = {"low_density_rural", "very_low_density_rural"}
-        is_hq_rural = pd.Series(True, index=raw.index)
+        is_hq_rural = pd.Series(True, index=underpost_raw.index)
 
         if osm_lanes is not None:
             is_hq_rural &= osm_lanes.fillna(0) >= 4
@@ -274,12 +305,11 @@ def score_limit_credibility_gap(
         if ghsl_settlement_class is not None:
             is_hq_rural &= ghsl_settlement_class.isin(rural_classes)
         else:
-            # Without GHSL we can't confirm "rural" — don't apply dampener
             is_hq_rural &= False
 
-        raw = raw * np.where(is_hq_rural, 0.5, 1.0)
+        underpost_raw = underpost_raw * np.where(is_hq_rural, 0.5, 1.0)
 
-    return raw
+    return (0.65 * overpost_raw + 0.35 * underpost_raw).clip(0, 100)
 
 
 def score_vru_context_risk(gdf: gpd.GeoDataFrame) -> pd.Series:
@@ -383,6 +413,7 @@ def compute_speed_safety_score(
     gdf.loc[mask, "sub_score_limit_credibility"] = score_limit_credibility_gap(
         gdf.loc[mask, "speed_85th"],
         gdf.loc[mask, "speed_limit"],
+        median_speed          = gdf.loc[mask, "median_speed"]          if "median_speed"          in gdf.columns else None,
         osm_lanes             = gdf.loc[mask, "osm_lanes"]             if "osm_lanes"             in gdf.columns else None,
         osm_surface           = gdf.loc[mask, "osm_surface"]           if "osm_surface"           in gdf.columns else None,
         ghsl_settlement_class = gdf.loc[mask, "ghsl_settlement_class"] if "ghsl_settlement_class" in gdf.columns else None,
@@ -488,11 +519,18 @@ def _generate_recommendation(row: pd.Series) -> str:
                 f"standard ({ss:.0f} km/h)."
             )
 
-    if pd.notna(f85) and pd.notna(posted) and f85 > posted * 1.10:
-        parts.append(
-            f"85th percentile speed ({f85:.0f} km/h) significantly exceeds "
-            f"posted limit — enforcement or physical traffic calming needed."
-        )
+    if pd.notna(f85) and pd.notna(posted):
+        if posted > f85 + 15:
+            parts.append(
+                f"Road behaviour ({f85:.0f} km/h F85) is well below the posted limit "
+                f"({posted:.0f} km/h) — road conditions do not support the posted number; "
+                f"review limit or infrastructure."
+            )
+        elif f85 > posted * 1.10:
+            parts.append(
+                f"85th percentile speed ({f85:.0f} km/h) significantly exceeds "
+                f"posted limit — enforcement or physical traffic calming needed."
+            )
 
     if band in ("Critical", "High Risk"):
         parts.append("Priority segment: recommend immediate site review.")

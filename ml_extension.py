@@ -39,26 +39,44 @@ log = get_logger(__name__)
 NUMERIC_FEATURES = [
     "ss_limit",
     "speed_limit",
+    "speed_limit_to_ss_ratio",          # derived: posted / SS limit — encodes overposting directly
+    "speed_limit_gap",                  # derived: posted − SS limit (signed)
     "urban_pct",
     "exposure_score",
     "pop_density_500m",
     "dist_to_school_m",
     "dist_to_hospital_m",
-    "ghsl_settlement_code",             # 7-level urbanicity score (11–30); NaN handled by XGBoost
+    "intersection_score",               # OSM junction density 0–100
+    "ghsl_settlement_code",             # 7-level urbanicity score (11–30)
     "ntl_exposure_score",               # VIIRS nighttime light intensity 0–100
     "sinuosity",                        # road curvature ≥1.0; straight = 1.0
     "infra_visibility_score",           # Mapillary coverage 0–100
     "dist_to_nearest_vru_attractor_m",  # min(school, hospital, market, transit) distance
+    "osm_lanes",                        # number of lanes — divided road proxy
+    "mapillary_ped_crossing",           # CV-detected ped crossings in grid cell
+    "mapillary_street_lamp",            # CV-detected street lamps
+    "mapillary_guardrail",              # CV-detected guardrails
+    "mapillary_n_features",             # total Mapillary features in cell
 ]
-CAT_FEATURES = ["road_class_norm", "land_use", "ghsl_settlement_class"]
+CAT_FEATURES = [
+    "road_class_norm",
+    "land_use",
+    "ghsl_settlement_class",
+    "country_code",                     # TH vs MH have different posted-limit cultures
+    "osm_lit",                          # yes/no/unknown — lighting status
+    "osm_oneway",                       # yes/no — divided road proxy
+    "osm_surface",                      # paved/unpaved/asphalt etc.
+]
 
 XGB_PARAMS = dict(
-    n_estimators=300,
-    max_depth=5,
-    learning_rate=0.05,
+    n_estimators=600,
+    max_depth=6,
+    learning_rate=0.03,
     subsample=0.8,
-    colsample_bytree=0.8,
-    min_child_weight=5,
+    colsample_bytree=0.75,
+    min_child_weight=4,
+    gamma=0.1,
+    reg_alpha=0.05,
     random_state=42,
     n_jobs=-1,
     verbosity=0,
@@ -159,6 +177,12 @@ def run_ml_extension(
             n_imputed = int(missing_limit.sum())
             log.info(f"  Imputed speed_limit for {n_imputed:,} unscored segments "
                      f"(median posted/ss ratio by road class)")
+
+    # Derived features — computed on the full gdf so train + pred get the same values
+    sl  = pd.to_numeric(gdf["speed_limit"], errors="coerce")
+    ss  = pd.to_numeric(gdf["ss_limit"],    errors="coerce").replace(0, np.nan)
+    gdf["speed_limit_to_ss_ratio"] = sl / ss
+    gdf["speed_limit_gap"]         = sl - ss
 
     X_train, cat_cols = _build_feature_matrix(gdf[train_mask])
     y_train = gdf.loc[train_mask, "sss"].values.astype(float)

@@ -63,6 +63,7 @@ import time
 import warnings
 import json
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -75,6 +76,14 @@ MAPILLARY_BASE = "https://graph.mapillary.com"
 
 # Mapillary API v4 returns these three coarse object_type categories
 OBJECT_TYPES = {"trafficsign", "mvd_fast", "panoptic"}
+
+# Mapillary traffic sign taxonomy prefixes used for CV feature extraction
+_SPEED_LIMIT_PREFIXES = ("regulatory--maximum-speed-limit--",
+                         "complementary--maximum-speed-limit--")
+_PED_CROSSING_TOKENS  = ("pedestrian-crossing", "crosswalk")
+_STREET_LAMP_TOKENS   = ("street-light", "street-lamp")
+_GUARDRAIL_TOKENS     = ("guardrail", "barrier-concrete", "barrier-jersey",
+                         "barrier-water", "barrier-other")
 
 
 # ── API client ────────────────────────────────────────────────────────────────
@@ -170,6 +179,50 @@ def _aggregate_features(features: list, segment_length_km: float = 0.1) -> dict:
     }
 
 
+# ── Thread workers (module-level for picklability) ────────────────────────────
+
+def _fetch_standard_cell(args: tuple) -> tuple:
+    """Worker: query one grid cell for standard map features (trafficsign/mvd/panoptic)."""
+    west, south, token = args
+    east  = west + _GRID_DEG
+    north = south + _GRID_DEG
+    features = _query_map_features((west, south, east, north), token, timeout=8)
+    key = f"{west:.3f},{south:.3f}"
+    n_sign = sum(1 for f in features if f.get("object_type") == "trafficsign")
+    n_mvd  = sum(1 for f in features if f.get("object_type") == "mvd_fast")
+    n_pan  = sum(1 for f in features if f.get("object_type") == "panoptic")
+    return key, {"n_total": len(features), "n_sign": n_sign, "n_mvd": n_mvd,
+                 "n_panoptic": n_pan, "covered": len(features) > 0}
+
+
+def _fetch_cv_cell(args: tuple) -> tuple:
+    """Worker: query one grid cell with object_value for CV feature extraction."""
+    west, south, token = args
+    east  = west + _GRID_DEG
+    north = south + _GRID_DEG
+    key   = f"{west:.3f},{south:.3f}"
+    url    = f"{MAPILLARY_BASE}/map_features"
+    params = {"access_token": token, "fields": "id,object_type,object_value",
+              "bbox": f"{west},{south},{east},{north}"}
+    features = []
+    for attempt in range(2):
+        try:
+            resp = requests.get(url, params=params, timeout=10)
+            if resp.status_code == 200:
+                features = resp.json().get("data", [])
+                break
+            elif resp.status_code == 429:
+                time.sleep(2 ** attempt)
+            elif resp.status_code in (400, 500):
+                break
+        except (requests.Timeout, requests.RequestException):
+            if attempt == 0:
+                time.sleep(1)
+    cv_data = _aggregate_cv_features(features)
+    cv_data["covered"] = len(features) > 0
+    return key, cv_data
+
+
 # Grid size for batched API queries — 0.01° × 0.01° = 0.0001 sq deg.
 # NOTE: 0.09° × 0.09° cells (~10km) cause server timeouts in dense urban areas like
 # Bangkok where a single cell may contain 100,000+ detections. 0.01° cells (~1km)
@@ -183,9 +236,10 @@ def enrich_with_mapillary(
     gdf: gpd.GeoDataFrame,
     token: str = None,
     cache_dir: str = "enrichment_data/mapillary_cache",
-    delay_s: float = 0.03,
+    delay_s: float = 0.0,
     segment_mask: "pd.Series | None" = None,
     max_new_queries: int = None,
+    max_workers: int = 8,
 ) -> gpd.GeoDataFrame:
     """
     Enrich road segments with Mapillary infrastructure features.
@@ -236,7 +290,6 @@ def enrich_with_mapillary(
         with open(grid_cache_file) as f:
             grid_cache = json.load(f)
 
-    gdf = gdf.copy()
     for col in ["mapillary_covered", "mapillary_n_features",
                 "mapillary_n_trafficsigns", "mapillary_n_mvd",
                 "infra_visibility_score"]:
@@ -270,64 +323,62 @@ def enrich_with_mapillary(
               if max_new_queries and n_new > max_new_queries else
               f"  Est. query time: ~{n_will_query * (delay_s + 0.4) / 60:.1f} min")
 
-    new_queries = 0
-    for i, (_, cell) in enumerate(unique_cells.iterrows()):
-        west  = cell["_grid_lon"]
-        south = cell["_grid_lat"]
-        east  = west + _GRID_DEG
-        north = south + _GRID_DEG
-        key   = f"{west:.3f},{south:.3f}"
+    pending = [
+        (f"{r['_grid_lon']:.3f},{r['_grid_lat']:.3f}", r["_grid_lon"], r["_grid_lat"])
+        for _, r in unique_cells.iterrows()
+        if f"{r['_grid_lon']:.3f},{r['_grid_lat']:.3f}" not in grid_cache
+    ]
+    if max_new_queries is not None:
+        pending = pending[:max_new_queries]
 
-        if key in grid_cache:
-            continue
-
-        if max_new_queries is not None and new_queries >= max_new_queries:
-            break
-
-        features = _query_map_features((west, south, east, north), token, timeout=8)
-        n_sign = sum(1 for f in features if f.get("object_type") == "trafficsign")
-        n_mvd  = sum(1 for f in features if f.get("object_type") == "mvd_fast")
-        n_pan  = sum(1 for f in features if f.get("object_type") == "panoptic")
-        grid_cache[key] = {
-            "n_total": len(features), "n_sign": n_sign,
-            "n_mvd": n_mvd, "n_panoptic": n_pan,
-            "covered": len(features) > 0,
-        }
-        new_queries += 1
-        if delay_s > 0:
-            time.sleep(delay_s)
-
-        if (i + 1) % 20 == 0:
-            n_cov = sum(1 for v in grid_cache.values() if v.get("covered"))
-            print(f"  [{i+1:,}/{len(unique_cells):,}] queried={new_queries:,}  cells_covered={n_cov:,}")
-            with open(grid_cache_file, "w") as f:
-                json.dump(grid_cache, f)
-
+    new_queries = len(pending)
     if new_queries > 0:
+        workers = min(max_workers, new_queries)
+        print(f"  Querying {new_queries:,} new cells in parallel (workers={workers}) ...")
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            future_map = {
+                pool.submit(_fetch_standard_cell, (west, south, token)): key
+                for key, west, south in pending
+            }
+            completed = 0
+            for future in as_completed(future_map):
+                key, data = future.result()
+                grid_cache[key] = data
+                completed += 1
+                if completed % 50 == 0:
+                    n_cov = sum(1 for v in grid_cache.values() if v.get("covered"))
+                    print(f"  [{completed:,}/{new_queries:,}] cells_covered={n_cov:,}")
+                    with open(grid_cache_file, "w") as f:
+                        json.dump(grid_cache, f)
+
         with open(grid_cache_file, "w") as f:
             json.dump(grid_cache, f)
 
-    # Assign grid coverage to segments
-    covered = 0
-    for _, cell in unique_cells.iterrows():
-        key  = f"{cell['_grid_lon']:.3f},{cell['_grid_lat']:.3f}"
-        data = grid_cache.get(key, {})
+    # Vectorised assignment — build a string key per row once, then map from
+    # cache dicts. O(n) vs the previous O(cells × rows) loop of .loc writes.
+    gdf["_ck"] = (gdf["_grid_lon"].map("{:.3f}".format) + "," +
+                  gdf["_grid_lat"].map("{:.3f}".format))
+
+    vis_map = {}; ntot_map = {}; nsign_map = {}; nmvd_map = {}
+    for key, data in grid_cache.items():
         if not data.get("covered"):
             continue
-        mask = (gdf["_grid_lon"] == cell["_grid_lon"]) & (gdf["_grid_lat"] == cell["_grid_lat"])
-        gdf.loc[mask, "mapillary_covered"]        = True
-        gdf.loc[mask, "mapillary_n_features"]     = data["n_total"]
-        gdf.loc[mask, "mapillary_n_trafficsigns"] = data["n_sign"]
-        gdf.loc[mask, "mapillary_n_mvd"]          = data["n_mvd"]
-        base = 30.0
-        sc   = min(data["n_sign"] / 5, 1.0) * 40.0
-        mc   = min(data["n_mvd"] / 10, 1.0) * 20.0
-        pc   = min(data.get("n_panoptic", 0) / 20, 1.0) * 10.0
-        gdf.loc[mask, "infra_visibility_score"] = float(np.clip(base + sc + mc + pc, 0, 100))
-        covered += mask.sum()
+        ns = data.get("n_sign", 0)
+        nm = data.get("n_mvd",  0)
+        np_ = data.get("n_panoptic", 0)
+        vis_map[key]   = float(np.clip(30 + min(ns/5,1)*40 + min(nm/10,1)*20 + min(np_/20,1)*10, 0, 100))
+        ntot_map[key]  = data.get("n_total", 0)
+        nsign_map[key] = ns
+        nmvd_map[key]  = nm
 
-    # Drop temp columns
-    gdf.drop(columns=["_grid_lon", "_grid_lat"], inplace=True, errors="ignore")
+    gdf["mapillary_covered"]        = gdf["_ck"].isin(vis_map)
+    gdf["infra_visibility_score"]   = gdf["_ck"].map(vis_map).fillna(0.0)
+    gdf["mapillary_n_features"]     = gdf["_ck"].map(ntot_map).fillna(0)
+    gdf["mapillary_n_trafficsigns"] = gdf["_ck"].map(nsign_map).fillna(0)
+    gdf["mapillary_n_mvd"]          = gdf["_ck"].map(nmvd_map).fillna(0)
+    covered = int(gdf["mapillary_covered"].sum())
+
+    gdf.drop(columns=["_ck", "_grid_lon", "_grid_lat"], inplace=True, errors="ignore")
 
     total = work_mask.sum()
     print(f"\n  Mapillary coverage: {covered:,} / {total:,} segments "
@@ -338,6 +389,269 @@ def enrich_with_mapillary(
 
     n_blind = ((gdf["infra_visibility_score"] == 0) & work_mask).sum()
     print(f"  Infrastructure blindspots (score=0, no Mapillary data): {n_blind:,} segments")
+    return gdf
+
+
+# ── CV feature helpers ────────────────────────────────────────────────────────
+
+def _parse_speed_kmh(value: str) -> int | None:
+    """Extract speed km/h from Mapillary object_value taxonomy string.
+    'regulatory--maximum-speed-limit--90--g1' → 90
+    Returns None if value does not contain a speed limit.
+    """
+    if not value:
+        return None
+    v = value.lower()
+    for prefix in _SPEED_LIMIT_PREFIXES:
+        if prefix in v:
+            tail = v.split(prefix)[-1].split("--")[0]
+            try:
+                speed = int(tail)
+                if 5 <= speed <= 140:
+                    return speed
+            except ValueError:
+                pass
+    return None
+
+
+def _aggregate_cv_features(features: list) -> dict:
+    """Parse object_value from Mapillary map_features response.
+
+    object_value is available in the public Mapillary v4 API when
+    fields=id,object_type,object_value is requested. If the API does not
+    return it (e.g. enterprise-only restriction), all counts default to 0.
+    """
+    from collections import Counter
+    speeds, ped, lamp, guard = [], 0, 0, 0
+
+    for f in features:
+        val = (f.get("object_value") or f.get("value") or "").lower()
+        if not val:
+            continue
+        spd = _parse_speed_kmh(val)
+        if spd:
+            speeds.append(spd)
+        if any(t in val for t in _PED_CROSSING_TOKENS):
+            ped += 1
+        if any(t in val for t in _STREET_LAMP_TOKENS):
+            lamp += 1
+        if any(t in val for t in _GUARDRAIL_TOKENS):
+            guard += 1
+
+    detected_speed = Counter(speeds).most_common(1)[0][0] if speeds else None
+    return {
+        "detected_speed": detected_speed,
+        "n_speed_signs":  len(speeds),
+        "n_ped_crossing": ped,
+        "n_street_lamp":  lamp,
+        "n_guardrail":    guard,
+    }
+
+
+def enrich_with_mapillary_cv(
+    gdf: gpd.GeoDataFrame,
+    token: str = None,
+    cache_dir: str = "enrichment_data/mapillary_cache",
+    delay_s: float = 0.0,
+    segment_mask: "pd.Series | None" = None,
+    max_new_queries: int = None,
+    max_workers: int = 8,
+) -> gpd.GeoDataFrame:
+    """Query Mapillary map_features with object_value to extract CV detections.
+
+    Uses a SEPARATE cache (cv_grid_cache.json) from enrich_with_mapillary()
+    so the standard feature cache is not invalidated.
+
+    Designed to run AFTER enrich_with_mapillary() — targeted to high-risk
+    segments (Critical + High Risk) by default via segment_mask.
+
+    New columns:
+      mapillary_detected_speed  — modal detected speed limit sign (km/h), NaN if none
+      mapillary_speed_mismatch  — |detected_speed − posted_limit|, NaN if no sign
+      mapillary_ped_crossing    — pedestrian crossing detections in grid cell
+      mapillary_street_lamp     — street lamp detections in grid cell
+      mapillary_guardrail       — guardrail/barrier detections in grid cell
+    """
+    if token is None:
+        token = os.environ.get("MAPILLARY_TOKEN", "")
+    if not token:
+        print("  [CV] No Mapillary token — skipping CV enrichment")
+        return gdf
+
+    cache_path = Path(cache_dir)
+    cache_path.mkdir(parents=True, exist_ok=True)
+    cv_cache_file = cache_path / "cv_grid_cache.json"
+
+    cv_cache = {}
+    if cv_cache_file.exists():
+        with open(cv_cache_file) as f:
+            cv_cache = json.load(f)
+
+    gdf = gdf.copy()
+    for col in ["mapillary_detected_speed", "mapillary_speed_mismatch",
+                "mapillary_ped_crossing", "mapillary_street_lamp", "mapillary_guardrail"]:
+        gdf[col] = np.nan
+
+    bounds = gdf["geometry"].bounds
+    midx = (bounds["minx"] + bounds["maxx"]) / 2
+    midy = (bounds["miny"] + bounds["maxy"]) / 2
+    gdf["_cv_lon"] = (midx / _GRID_DEG).astype(int) * _GRID_DEG
+    gdf["_cv_lat"] = (midy / _GRID_DEG).astype(int) * _GRID_DEG
+
+    work_mask = (segment_mask.reindex(gdf.index, fill_value=False)
+                 if segment_mask is not None
+                 else pd.Series(True, index=gdf.index))
+
+    unique_cells = gdf.loc[work_mask, ["_cv_lon", "_cv_lat"]].drop_duplicates()
+    n_new = sum(
+        1 for _, r in unique_cells.iterrows()
+        if f"{r['_cv_lon']:.3f},{r['_cv_lat']:.3f}" not in cv_cache
+    )
+    n_will = min(n_new, max_new_queries) if max_new_queries is not None else n_new
+    print(f"\n  [CV] Grid cells: {len(unique_cells):,}  ({len(cv_cache):,} cached, {n_new:,} new)")
+    if n_new > 0:
+        est = n_will * (delay_s + 0.5) / 60
+        print(f"  [CV] Querying {n_will:,} new cells — est. {est:.1f} min")
+
+    pending = [
+        (f"{r['_cv_lon']:.3f},{r['_cv_lat']:.3f}", r["_cv_lon"], r["_cv_lat"])
+        for _, r in unique_cells.iterrows()
+        if f"{r['_cv_lon']:.3f},{r['_cv_lat']:.3f}" not in cv_cache
+    ]
+    if max_new_queries is not None:
+        pending = pending[:max_new_queries]
+
+    new_queries = len(pending)
+    if new_queries > 0:
+        workers = min(max_workers, new_queries)
+        est = new_queries / (workers * 2)  # rough: 2 cells/sec/worker
+        print(f"  [CV] Querying {new_queries:,} cells in parallel (workers={workers}) "
+              f"— est. {est:.0f}s")
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            future_map = {
+                pool.submit(_fetch_cv_cell, (west, south, token)): key
+                for key, west, south in pending
+            }
+            completed = 0
+            for future in as_completed(future_map):
+                key, cv_data = future.result()
+                cv_cache[key] = cv_data
+                completed += 1
+                if completed % 50 == 0:
+                    print(f"  [CV] {completed:,}/{new_queries:,} complete")
+                    with open(cv_cache_file, "w") as f:
+                        json.dump(cv_cache, f)
+
+        with open(cv_cache_file, "w") as f:
+            json.dump(cv_cache, f)
+
+    # Vectorised assignment
+    gdf["_ck"] = (gdf["_cv_lon"].map("{:.3f}".format) + "," +
+                  gdf["_cv_lat"].map("{:.3f}".format))
+
+    spd_map = {}; ped_map = {}; lamp_map = {}; guard_map = {}
+    for key, data in cv_cache.items():
+        if not data:
+            continue
+        ds = data.get("detected_speed")
+        if ds is not None:
+            spd_map[key] = float(ds)
+        ped_map[key]   = float(data.get("n_ped_crossing", 0))
+        lamp_map[key]  = float(data.get("n_street_lamp",  0))
+        guard_map[key] = float(data.get("n_guardrail",    0))
+
+    gdf["mapillary_detected_speed"] = gdf["_ck"].map(spd_map)
+    gdf["mapillary_ped_crossing"]   = gdf["_ck"].map(ped_map)
+    gdf["mapillary_street_lamp"]    = gdf["_ck"].map(lamp_map)
+    gdf["mapillary_guardrail"]      = gdf["_ck"].map(guard_map)
+    if "speed_limit" in gdf.columns and spd_map:
+        gdf["mapillary_speed_mismatch"] = (
+            gdf["speed_limit"] - gdf["mapillary_detected_speed"]
+        ).abs()
+
+    gdf.drop(columns=["_ck", "_cv_lon", "_cv_lat"], inplace=True, errors="ignore")
+
+    n_speed = gdf["mapillary_detected_speed"].notna().sum()
+    n_ped   = (gdf["mapillary_ped_crossing"].fillna(0) > 0).sum()
+    n_lamp  = (gdf["mapillary_street_lamp"].fillna(0) > 0).sum()
+    print(f"  [CV] Speed signs: {n_speed:,} segments  |  Ped crossings: {n_ped:,}  |  "
+          f"Street lamps: {n_lamp:,}")
+    if n_speed == 0 and new_queries > 0:
+        print("  [CV] Note: object_value returned no speed data — "
+              "public API may not expose this field. CV columns will be NaN.")
+    return gdf
+
+
+def apply_mapillary_cv_to_scoring(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Apply CV-derived Mapillary detections to scoring sub-scores.
+
+    Called separately from apply_mapillary_to_scoring() to avoid double-
+    applying the standard visibility adjustments.
+
+    Adjustments:
+    1. Speed sign mismatch: if detected sign differs from posted by >15 km/h,
+       amplify the credibility gap sub-score by up to 15%.
+    2. Pedestrian crossing detected: amplify VRU sub-score by 10%.
+    3. Street lamp detected + osm_lit missing/unknown: treat road as lit
+       (synthesise osm_lit='yes') for downstream use.
+    """
+    gdf = gdf.copy()
+
+    if "mapillary_speed_mismatch" not in gdf.columns:
+        return gdf
+
+    mismatch = gdf["mapillary_speed_mismatch"].fillna(0)
+    ped      = gdf["mapillary_ped_crossing"].fillna(0)
+    lamp     = gdf["mapillary_street_lamp"].fillna(0)
+
+    # 1. Speed sign mismatch → credibility amplifier (max +15%)
+    if "sub_score_limit_credibility" in gdf.columns:
+        high_mismatch = mismatch > 15
+        if high_mismatch.any():
+            boost = np.clip((mismatch - 15) / 20, 0, 0.15)  # 0 at 15 km/h → 0.15 at 35+ km/h
+            gdf.loc[high_mismatch, "sub_score_limit_credibility"] = (
+                gdf.loc[high_mismatch, "sub_score_limit_credibility"] * (1 + boost[high_mismatch])
+            ).clip(0, 100)
+            n = int(high_mismatch.sum())
+            print(f"  [CV] Credibility amplified on {n:,} segments (sign mismatch >15 km/h)")
+
+    # 2. Pedestrian crossing detected → VRU amplifier (+10%)
+    if "sub_score_vru_risk" in gdf.columns:
+        has_ped = ped > 0
+        if has_ped.any():
+            gdf.loc[has_ped, "sub_score_vru_risk"] = (
+                gdf.loc[has_ped, "sub_score_vru_risk"] * 1.10
+            ).clip(0, 100)
+            print(f"  [CV] VRU score amplified on {int(has_ped.sum()):,} segments "
+                  f"(pedestrian crossing detected)")
+
+    # 3. Street lamp detected → synthesise lit flag where osm_lit is unknown
+    if "osm_lit" in gdf.columns:
+        unknown_lit = gdf["osm_lit"].isna() | gdf["osm_lit"].isin(["", "unknown"])
+        synth = unknown_lit & (lamp > 0)
+        if synth.any():
+            gdf.loc[synth, "osm_lit"] = "yes"
+            print(f"  [CV] osm_lit synthesised as 'yes' on {int(synth.sum()):,} segments "
+                  f"(street lamp detected, osm_lit was unknown)")
+
+    # Recompute SSS if sub-scores were modified
+    if "sub_score_limit_credibility" in gdf.columns:
+        from scoring import WEIGHTS
+        from config import SCORE_BANDS
+        mask = gdf["scoreable"] & gdf["sss"].notna()
+        if mask.any():
+            gdf.loc[mask, "sss"] = (
+                WEIGHTS["speed_limit_alignment"]  * gdf.loc[mask, "sub_score_limit_alignment"] +
+                WEIGHTS["limit_credibility_gap"]  * gdf.loc[mask, "sub_score_limit_credibility"] +
+                WEIGHTS["vru_context_risk"]        * gdf.loc[mask, "sub_score_vru_risk"]
+            ).clip(0, 100)
+            def _band(s):
+                for name, (lo, hi) in SCORE_BANDS.items():
+                    if lo <= s <= hi:
+                        return name
+                return "Acceptable"
+            gdf.loc[mask, "sss_band"] = gdf.loc[mask, "sss"].map(_band)
+
     return gdf
 
 

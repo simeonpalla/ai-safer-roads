@@ -66,6 +66,35 @@ POI_QUERIES = {
     "crossings": """(
   node["railway"="level_crossing"];
 ); out body;""",
+
+    # OSM schools — saved into enrichment_data/schools/ alongside HOTOSM files.
+    # _load_amenities() merges all geojsons in the folder automatically.
+    "schools_osm": """(
+  node["amenity"="school"];
+  node["amenity"="kindergarten"];
+  node["amenity"="childcare"];
+  way["amenity"="school"];
+  way["amenity"="kindergarten"];
+); out center;""",
+
+    # OSM hospitals/clinics — saved into enrichment_data/hospitals/
+    "hospitals_osm": """(
+  node["amenity"="hospital"];
+  node["amenity"="clinic"];
+  node["amenity"="health_post"];
+  node["healthcare"="hospital"];
+  node["healthcare"="clinic"];
+  way["amenity"="hospital"];
+  way["amenity"="clinic"];
+); out center;""",
+}
+
+# Types that should land in a different output folder than their own name.
+# e.g. schools_osm -> enrichment_data/schools/schools_osm_MH.geojson
+# so _load_amenities("enrichment_data/schools/") picks up both HOTOSM + OSM.
+OUTPUT_FOLDER_OVERRIDE = {
+    "schools_osm":   "schools",
+    "hospitals_osm": "hospitals",
 }
 
 # Buffer added to road data bbox before querying (degrees)
@@ -137,10 +166,11 @@ def main():
     out_root = Path("enrichment_data")
 
     for poi_type, query_body in POI_QUERIES.items():
-        (out_root / poi_type).mkdir(parents=True, exist_ok=True)
+        folder = OUTPUT_FOLDER_OVERRIDE.get(poi_type, poi_type)
+        (out_root / folder).mkdir(parents=True, exist_ok=True)
 
         for country_code in ["TH", "MH"]:
-            out_file = out_root / poi_type / f"{poi_type}_{country_code}.geojson"
+            out_file = out_root / folder / f"{poi_type}_{country_code}.geojson"
 
             if out_file.exists():
                 existing = gpd.read_file(out_file)

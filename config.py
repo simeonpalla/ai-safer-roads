@@ -175,8 +175,12 @@ LAND_USE_MAP = {
 
 # ─── Score band thresholds ────────────────────────────────────────────────────
 # ANCHORED TO SUB-SCORE MEANING (v3.2, June 2026) — not percentile-based.
+# NOTE (v4.0): weights changed to 0.25 × align + 0.40 × cred + 0.35 × vru.
+# Credibility sub-score now captures BOTH overposting and underposting directions.
+# The bands below were calibrated on old 38/30/32 weights and will shift with
+# the new formula — recalibrate after the first run with these weights.
 #
-# SSS = 0.38 × align + 0.30 × cred + 0.32 × vru
+# SSS = 0.25 × align + 0.40 × cred + 0.35 × vru
 #
 # The VRU sub-score already encodes area type:
 #   urban secondary:  vru ≈ 75  →  floor contribution = 0.32 × 75 = 24 pts
@@ -214,26 +218,30 @@ LAND_USE_MAP = {
 #     Example: rural primary posted 100 km/h (ss_limit = 70, 43% excess),
 #              F85 = 108 (gap = 28 km/h, non-credible) → SSS ≈ 67 ✓
 #
-# Real data run (n=14,711, June 2026):
-#   Critical  ≥ 65:   811 segments  (5.5%)
-#   High Risk 52–65: 4,795 segments (32.6%)
-#   Moderate  35–52: 4,368 segments (29.7%)
-#   Acceptable 0–35: 4,737 segments (32.2%)
+# Real data run (n=14,711, June 2026) with v4.0 weights (25/40/35):
+#   Critical  ≥ 72:  1,492 segments (10.1%)
+#   High Risk 49–72: 3,699 segments (25.1%)
+#   Moderate  33–49: 3,884 segments (26.4%)
+#   Acceptable 0–33: 5,636 segments (38.3%)
 #
-# NOTE on discrete clusters: SSS has a large cluster at ~63.96 (rounds to
-# 64.0, 16.8% of segments) from roads sharing the same road-class × land-use
-# Safe System threshold. The Critical cutoff (65) sits just above this cluster,
-# so it cleanly captures only the genuinely extreme tail.
+# Thresholds anchored to percentiles (p90/p65/p35) so bands are stable
+# across datasets of similar road mix. Physical meaning:
+#   Critical (>=72): requires strong credibility signal (road conditions
+#     do not support the limit) AND either significant WHO misalignment
+#     or high VRU exposure. Both dimensions elevated simultaneously.
+#   Acceptable (<33): low scores across all three sub-scores — the limit
+#     broadly matches road behaviour and Safe System standard.
 #
 # HONESTY NOTE: bands are anchored to what the SCORE means (sub-score physics),
 # NOT validated against crash/fatality outcomes — no outcome data exists for
-# this dataset. "Critical" means the limit is severely misaligned with Safe
-# System standards; it does not claim crashes have occurred here.
+# this dataset. "Critical" means the limit is severely misaligned with real
+# road behaviour and Safe System standards; it does not claim crashes have
+# occurred here.
 SCORE_BANDS = {
-    "Critical":   (65, 100),
-    "High Risk":  (52,  65),
-    "Moderate":   (35,  52),
-    "Acceptable": ( 0,  35),
+    "Critical":   (72, 100),
+    "High Risk":  (49,  72),
+    "Moderate":   (33,  49),
+    "Acceptable": ( 0,  33),
 }
 
 BAND_COLORS = {

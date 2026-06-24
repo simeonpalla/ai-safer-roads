@@ -62,6 +62,143 @@ from enrichment import _load_amenities, _load_intersections, SCHOOL_BUFFER_M, \
                         HOSPITAL_BUFFER_M
 
 
+def _stag(row: pd.Series, col: str) -> str:
+    """Safely extract a string tag column — handles pd.NA, None, and 'nan'/'None' strings."""
+    v = row.get(col)
+    try:
+        if pd.isna(v):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    s = str(v).strip()
+    return "" if s in ("nan", "None", "<NA>", "NaT", "none") else s
+
+
+def _build_reason_html(row: pd.Series) -> str:
+    """
+    Plain-language reason block driven by F85/median/OSM/VIIRS signals.
+    No threshold labels in the text — every sentence traces to an observed data point.
+    """
+    posted = row.get("speed_limit", np.nan)
+    f85    = row.get("speed_85th",  np.nan)
+    med    = row.get("median_speed", np.nan)
+
+    if pd.isna(f85) or pd.isna(posted):
+        return ""
+
+    osm_lit     = _stag(row, "osm_lit").lower()
+    osm_surface = _stag(row, "osm_surface").lower()
+    osm_oneway  = _stag(row, "osm_oneway").lower()
+    try:
+        osm_lanes = float(row.get("osm_lanes") or 0)
+    except (ValueError, TypeError):
+        osm_lanes = 0
+    ntl = row.get("ntl_exposure_score", np.nan)
+
+    _UNPAVED = {"unpaved","gravel","dirt","ground","sand","earth",
+                "laterite","compacted","fine_gravel"}
+
+    gap = posted - f85  # positive = limit above F85 (overposted)
+
+    if gap > 15:
+        med_txt = f", median <b>{med:.0f} km/h</b>" if pd.notna(med) else ""
+        primary = (
+            f"Drivers travel at <b>{f85:.0f} km/h</b> (F85{med_txt}) — "
+            f"<b>{gap:.0f} km/h</b> below the posted limit of <b>{posted:.0f} km/h</b>. "
+            f"The posted limit is not calibrated to how this road is actually used."
+        )
+        icon, color = "⚠", "#c0392b"
+
+    elif f85 - posted > 15:
+        if pd.notna(med) and med > posted:
+            primary = (
+                f"Both F85 (<b>{f85:.0f} km/h</b>) and median (<b>{med:.0f} km/h</b>) "
+                f"exceed the posted <b>{posted:.0f} km/h</b> limit — "
+                f"not just outliers, the majority of drivers are over the limit."
+            )
+        else:
+            tail = (f"Median ({med:.0f} km/h) is below the limit — fast-tail, not broad speeding."
+                    if pd.notna(med) else "Review road design capacity.")
+            primary = (
+                f"85th percentile speed (<b>{f85:.0f} km/h</b>) exceeds the posted "
+                f"<b>{posted:.0f} km/h</b> limit. {tail}"
+            )
+        icon, color = "⚡", "#e67e22"
+
+    else:
+        primary = (
+            f"Speed behaviour broadly matches the posted limit — F85 <b>{f85:.0f} km/h</b>, "
+            f"posted <b>{posted:.0f} km/h</b>. Score is driven by road geometry and VRU context."
+        )
+        icon, color = "ℹ", "#2980b9"
+
+    # Supporting evidence bullets from observed road attributes
+    bullets = []
+    is_divided = (osm_oneway == "yes") or (osm_lanes >= 4)
+    if not is_divided:
+        bullets.append("Undivided carriageway — head-on collision exposure at speed")
+    else:
+        bullets.append("Divided / one-way carriageway — physically separated traffic flows")
+
+    if osm_surface in _UNPAVED:
+        bullets.append(f"Unpaved surface ({osm_surface}) — limits safe operating speed")
+
+    cv_lamp = row.get("mapillary_street_lamp", np.nan)
+    has_cv_lamp = pd.notna(cv_lamp) and float(cv_lamp) > 0
+    if osm_lit == "no":
+        bullets.append("No street lighting — elevated risk after dark")
+    elif osm_lit == "yes" or has_cv_lamp:
+        src = " (Mapillary CV)" if has_cv_lamp and osm_lit != "yes" else ""
+        bullets.append(f"Street lighting confirmed{src}")
+
+    if pd.notna(ntl) and float(ntl) > 40:
+        bullets.append(f"High nighttime activity (VIIRS: {ntl:.0f}/100) — elevated pedestrian/cyclist exposure after dark")
+    elif pd.notna(ntl) and float(ntl) > 15:
+        bullets.append(f"Moderate nighttime activity in area (VIIRS: {ntl:.0f}/100)")
+
+    cv_speed    = row.get("mapillary_detected_speed", np.nan)
+    cv_mismatch = row.get("mapillary_speed_mismatch", np.nan)
+    if pd.notna(cv_speed) and pd.notna(posted):
+        if pd.notna(cv_mismatch) and float(cv_mismatch) > 10:
+            direction = "below" if float(cv_speed) < float(posted) else "above"
+            bullets.append(
+                f"Speed sign detected via Mapillary: <b>{cv_speed:.0f} km/h</b> — "
+                f"{cv_mismatch:.0f} km/h {direction} posted limit"
+            )
+        else:
+            bullets.append(f"Speed sign detected via Mapillary: {cv_speed:.0f} km/h (consistent with posted)")
+
+    cv_ped = row.get("mapillary_ped_crossing", np.nan)
+    if pd.notna(cv_ped) and float(cv_ped) > 0:
+        bullets.append(f"Pedestrian crossing(s) detected in area: {cv_ped:.0f} (Mapillary)")
+
+    bullets_html = ""
+    if bullets:
+        items = "".join(f'<li style="margin:2px 0">{b}</li>' for b in bullets)
+        bullets_html = (f'<ul style="margin:5px 0 0 0;padding-left:18px;'
+                        f'font-size:11px;color:#444;line-height:1.4">{items}</ul>')
+
+    return (f'<div style="border-left:3px solid {color};background:#fafafa;'
+            f'padding:7px 10px;margin:8px 0;border-radius:0 4px 4px 0;'
+            f'font-size:12px;line-height:1.5">'
+            f'<span style="color:{color}">{icon}</span> {primary}'
+            f'{bullets_html}</div>')
+
+
+def _score_bar(label: str, value, weight_pct: int, color: str = "#666") -> str:
+    try:
+        w = max(0, min(100, int(float(value)))) if pd.notna(value) else 0
+    except (ValueError, TypeError):
+        w = 0
+    return (f'<div style="margin:4px 0">'
+            f'<div style="display:flex;justify-content:space-between;font-size:11px;color:#555">'
+            f'<span>{label} <span style="color:#bbb;font-size:10px">({weight_pct}%)</span></span>'
+            f'<b style="color:#333">{w}</b></div>'
+            f'<div style="background:#e8e8e8;border-radius:3px;height:6px;margin-top:2px">'
+            f'<div style="background:{color};width:{w}%;height:6px;border-radius:3px"></div>'
+            f'</div></div>')
+
+
 def score_to_color(score: float) -> str:
     if pd.isna(score):
         return "#cccccc"
@@ -84,142 +221,401 @@ def score_to_color(score: float) -> str:
 
 
 def _build_popup_html(row: pd.Series) -> str:
-    sss      = row.get("sss", np.nan)
-    band     = row.get("sss_band", "—")
-    sl       = row.get("speed_limit", np.nan)
-    ss       = row.get("ss_limit", np.nan)
-    f85      = row.get("speed_85th", np.nan)
-    med      = row.get("median_speed", np.nan)
-    pct_over = row.get("pct_over_limit", np.nan)
-    rc       = row.get("road_class", "—")
-    lu       = row.get("land_use", "—")
-    ghsl_cls = row.get("ghsl_settlement_class", None)
-    country  = row.get("country", "—")
-    rec      = row.get("sss_recommendation", "")
-    img_url  = row.get("image_url", "")
-    seg_id   = row.get("segment_id", "—")
+    def _f(col, default=np.nan):
+        v = row.get(col, default)
+        try:
+            return float(v) if pd.notna(v) else np.nan
+        except (TypeError, ValueError):
+            return np.nan
 
-    # Exposure — now broken into its actual calculation inputs, not a
-    # single combined number, per the request to show HOW it's computed.
-    exposure       = row.get("exposure_score", np.nan)
-    dist_school    = row.get("dist_to_school_m", np.nan)
-    dist_hospital  = row.get("dist_to_hospital_m", np.nan)
-    pop_density    = row.get("pop_density_500m", np.nan)
-    int_score      = row.get("intersection_score", np.nan)
-    pop_component  = row.get("exposure_component_population", np.nan)
-    tv_component   = row.get("exposure_component_traffic", np.nan)
+    sss  = _f("sss")
+    sl   = _f("speed_limit")
+    ss   = _f("ss_limit")
+    f85  = _f("speed_85th")
+    med  = _f("median_speed")
+    band    = row.get("sss_band", "—")
+    rc      = row.get("road_class", "—")
+    lu      = row.get("land_use", "—")
+    ghsl_cls= row.get("ghsl_settlement_class", None)
+    country = row.get("country", "—")
+    img_url = row.get("image_url", "")
 
-    # Priority Index fields (runs alongside SSS — see priority_scoring.py)
-    priority_index = row.get("priority_index", np.nan)
+    exposure      = _f("exposure_score")
+    dist_school   = _f("dist_to_school_m")
+    dist_hospital = _f("dist_to_hospital_m")
+    pop_density   = _f("pop_density_500m")
+    int_score     = _f("intersection_score")
+    pop_component = _f("exposure_component_population")
+    tv_component  = _f("exposure_component_traffic")
+
+    # OSM infrastructure tags
+    _osm_lanes_raw   = _f("osm_lanes")
+    _osm_surface_raw = _stag(row, "osm_surface")
+    _osm_lit_raw     = _stag(row, "osm_lit")
+    _osm_oneway_raw  = _stag(row, "osm_oneway")
+    _osm_junction    = _stag(row, "osm_junction")
+    _ntl             = _f("ntl_exposure_score")
+    _sinuosity       = _f("sinuosity")
+
+    priority_index = _f("priority_index")
     priority_band  = row.get("priority_band", "—")
-    likelihood     = row.get("likelihood_score", np.nan)
-    severity       = row.get("severity_score", np.nan)
+    likelihood     = _f("likelihood_score")
+    severity       = _f("severity_score")
 
-    # Tier 1 alignment-only score (covers segments with no behavioural data)
-    align_only      = row.get("alignment_only_score", np.nan)
+    align_only      = _f("alignment_only_score")
     align_only_band = row.get("alignment_only_band", "—")
-
-    band_color = BAND_COLORS.get(band, "#999")
-
-    img_html = ""
-    if img_url and isinstance(img_url, str) and img_url.startswith("http"):
-        img_html = f'<a href="{img_url}" target="_blank">📷 View street imagery</a><br>'
 
     def fmt(v, unit=""):
         return f"{v:.1f}{unit}" if pd.notna(v) else "—"
 
     def fmt_dist(v):
-        if pd.isna(v):
-            return "none within 50km (or no data loaded for this area)"
-        return f"{v:,.0f}m"
-
-    # Exposure breakdown badge — every input visible with its weight and
-    # what it's actually measuring, instead of one opaque number.
-    exp_html = ""
-    if pd.notna(exposure):
-        exp_html = f"""
-        <div style="background:#1a6fa8;color:white;padding:6px 8px;
-                    border-radius:4px;margin:4px 0;font-size:11px">
-          👥 <b>Exposure: {fmt(exposure)}</b> / 100<br>
-          <span style="font-weight:normal">
-          &nbsp;Nearest school (12% wt): {fmt_dist(dist_school)} {'(within 500m buffer)' if pd.notna(dist_school) and dist_school <= 500 else ''}<br>
-          &nbsp;Nearest hospital (8% wt): {fmt_dist(dist_hospital)} {'(within 750m buffer)' if pd.notna(dist_hospital) and dist_hospital <= 750 else ''}<br>
-          &nbsp;Population, 500m buffer (25% wt): {fmt(pop_density)} ppl/km²{f' ({pop_component:.0f}th pctile)' if pd.notna(pop_component) and pd.notna(pop_density) else ''}<br>
-          &nbsp;Intersection density (20% wt): {fmt(int_score)}/100<br>
-          &nbsp;Traffic volume (35% wt): {f'{tv_component:.0f}th percentile (country)' if pd.notna(tv_component) else '—'}
-          </span>
-        </div>"""
-
-    # Priority Index badge — SECONDARY "where to act first" layer, shown
-    # alongside SSS (not replacing it).
-    pi_html = ""
-    if pd.notna(priority_index):
-        pi_band_color = BAND_COLORS.get(priority_band, "#999")
-        pi_html = f"""
-        <div style="background:{pi_band_color};color:white;padding:4px 8px;
-                    border-radius:4px;margin:4px 0;font-size:11px">
-          🎯 Priority Index (secondary): {fmt(priority_index)} ({priority_band}) &nbsp;|&nbsp;
-          L: {fmt(likelihood)} · S: {fmt(severity)} · E: {fmt(exposure)}
-        </div>"""
-
-    # Tier 1 badge — only shown for segments that have alignment-only data
-    # (no F85/median), so it's clear why SSS itself might be blank.
-    t1_html = ""
-    if pd.isna(sss) and pd.notna(align_only):
-        t1_band_color = BAND_COLORS.get(align_only_band, "#999")
-        t1_html = f"""
-        <div style="background:{t1_band_color};color:white;padding:4px 8px;
-                    border-radius:4px;margin:4px 0;font-size:11px">
-          📏 Tier 1 only — posted limit vs Safe System standard: {fmt(align_only)} ({align_only_band})<br>
-          <span style="font-weight:normal">No GPS behavioural data (F85/median) for this segment — full SSS unavailable.</span>
-        </div>"""
+        return f"{v:,.0f} m" if pd.notna(v) else "no data"
 
     header_band  = band if pd.notna(sss) else (align_only_band if pd.notna(align_only) else "—")
     header_color = BAND_COLORS.get(header_band, "#999")
-    header_label = f"SSS: {fmt(sss)}" if pd.notna(sss) else (
-        f"Tier 1 only: {fmt(align_only)}" if pd.notna(align_only) else "No score")
+    header_label = f"SSS {fmt(sss)}" if pd.notna(sss) else (
+        f"Tier 1: {fmt(align_only)}" if pd.notna(align_only) else "No score")
 
-    return f"""
-    <div style="font-family:Arial,sans-serif;width:360px;font-size:13px">
-      <div style="background:{header_color};color:white;padding:8px 12px;
-                  border-radius:4px 4px 0 0;font-weight:bold;font-size:15px">
-        {header_band} &nbsp;·&nbsp; {header_label}
-      </div>
-      <div style="padding:10px 12px;border:1px solid #ddd;border-top:none;border-radius:0 0 4px 4px">
-        {t1_html}
-        {exp_html}
-        {pi_html}
-        <b>Segment:</b> {seg_id}<br>
-        <b>Country:</b> {country}<br>
-        <b>Road class:</b> {rc}<br>
-        <b>Land use:</b> {lu}{f' → <span style="color:#1a6fa8"><b>{ghsl_cls.replace("_"," ")}</b></span> (GHSL)' if ghsl_cls and str(ghsl_cls) not in ("nan","None","no_data") else ""}<br>
-        <hr style="margin:6px 0">
-        <b>Posted limit:</b> {fmt(sl, ' km/h')}<br>
-        <b>Safe System limit:</b> {fmt(ss, ' km/h')}<br>
-        <b>Median speed:</b> {fmt(med, ' km/h')}<br>
-        <b>85th pct speed:</b> {fmt(f85, ' km/h')}<br>
-        <b>% over limit:</b> {fmt(pct_over, '%')}<br>
-        <hr style="margin:6px 0">
-        <b>Sub-scores:</b><br>
-        &nbsp;Limit alignment: {fmt(row.get('sub_score_limit_alignment'))}<br>
-        &nbsp;Limit credibility gap: {fmt(row.get('sub_score_limit_credibility'))}<br>
-        &nbsp;VRU risk: {fmt(row.get('sub_score_vru_risk'))}<br>
-        &nbsp;Compliance (context only, not scored): {fmt(row.get('sub_score_compliance'))}<br>
-        {f'''<hr style="margin:6px 0">
-        <b>Priority Index sub-scores:</b><br>
-        &nbsp;Likelihood: limit credibility {fmt(row.get("sub_likelihood_speed_gap"))},
-          credibility {fmt(row.get("sub_likelihood_credibility"))},
-          variability {fmt(row.get("sub_likelihood_variability"))}<br>
-        &nbsp;Severity: Safe System {fmt(row.get("sub_severity_safe_system"))},
-          Nilsson {fmt(row.get("sub_severity_nilsson"))},
-          infrastructure {fmt(row.get("sub_severity_infrastructure"))},
-          helmet {fmt(row.get("sub_severity_helmet"))}<br>''' if pd.notna(priority_index) else ''}
-        <hr style="margin:6px 0">
-        <i style="font-size:11px;color:#555">{rec}</i><br>
-        {img_html}
-      </div>
-    </div>
-    """
+    # F85 color hint: red if overposted (limit well above F85), orange if underposted
+    f85_color = "#333"
+    if pd.notna(f85) and pd.notna(sl):
+        if sl > f85 + 15:
+            f85_color = "#c0392b"
+        elif f85 > sl + 15:
+            f85_color = "#e67e22"
+
+    # Speed grid — 2×2 layout
+    speed_grid = (
+        f'<table style="width:100%;border-collapse:separate;border-spacing:3px;margin:8px 0">'
+        f'<tr>'
+        f'<td style="padding:5px 8px;background:#f5f5f5;border-radius:4px;width:50%">'
+        f'<div style="color:#999;font-size:10px;text-transform:uppercase;letter-spacing:0.4px">Posted Limit</div>'
+        f'<div style="font-size:18px;font-weight:bold;color:#222">{fmt(sl)}'
+        f'<span style="font-size:11px;font-weight:normal;color:#888"> km/h</span></div></td>'
+        f'<td style="padding:5px 8px;background:#f5f5f5;border-radius:4px;width:50%">'
+        f'<div style="color:#999;font-size:10px;text-transform:uppercase;letter-spacing:0.4px">85th Pct Speed</div>'
+        f'<div style="font-size:18px;font-weight:bold;color:{f85_color}">{fmt(f85)}'
+        f'<span style="font-size:11px;font-weight:normal;color:#888"> km/h</span></div></td>'
+        f'</tr><tr>'
+        f'<td style="padding:5px 8px;background:#f9f9f9;border-radius:4px">'
+        f'<div style="color:#999;font-size:10px;text-transform:uppercase;letter-spacing:0.4px">Median Speed</div>'
+        f'<div style="font-size:14px;font-weight:bold;color:#444">{fmt(med)}'
+        f'<span style="font-size:11px;font-weight:normal;color:#888"> km/h</span></div></td>'
+        f'<td style="padding:5px 8px;background:#f9f9f9;border-radius:4px">'
+        f'<div style="color:#999;font-size:10px;text-transform:uppercase;letter-spacing:0.4px">Safe System Limit</div>'
+        f'<div style="font-size:14px;font-weight:bold;color:#444">{fmt(ss)}'
+        f'<span style="font-size:11px;font-weight:normal;color:#888"> km/h</span></div></td>'
+        f'</tr></table>'
+    )
+
+    # Reason block — data-driven, no WHO references
+    reason_html = _build_reason_html(row)
+
+    # Context line
+    ghsl_label = (ghsl_cls.replace("_", " ").title()
+                  if ghsl_cls and str(ghsl_cls) not in ("nan", "None", "no_data") else lu)
+    context_line = (f'<div style="font-size:11px;color:#888;margin:2px 0 6px 0">'
+                    f'{rc} &nbsp;·&nbsp; {ghsl_label} &nbsp;·&nbsp; {country}</div>')
+
+    # Score breakdown (collapsible)
+    score_details = (
+        f'<details style="margin:4px 0">'
+        f'<summary style="cursor:pointer;color:#1a6fa8;font-size:12px;'
+        f'user-select:none;padding:3px 0;list-style:none;outline:none">'
+        f'&#9654; Score breakdown</summary>'
+        f'<div style="padding:6px 2px 2px 2px">'
+        f'{_score_bar("Credibility gap", row.get("sub_score_limit_credibility"), 40, "#e67e22")}'
+        f'{_score_bar("VRU context",     row.get("sub_score_vru_risk"),          35, "#1a6fa8")}'
+        f'{_score_bar("Limit alignment", row.get("sub_score_limit_alignment"),   25, "#7c3aed")}'
+        f'</div></details>'
+    )
+
+    # Road infrastructure + nightlights (collapsible)
+    def _osm_disp(v):
+        return v if v and v not in ("nan", "None", "") else "—"
+
+    lanes_disp   = (f"{int(float(_osm_lanes_raw))}" if pd.notna(_osm_lanes_raw)
+                    else "—")
+    surface_disp = _osm_disp(_osm_surface_raw)
+    lit_disp     = _osm_disp(_osm_lit_raw)
+    oneway_disp  = ("one-way" if _osm_oneway_raw == "yes"
+                    else "two-way" if _osm_oneway_raw == "no" else "—")
+    junction_disp = _osm_disp(_osm_junction)
+
+    ntl_label = "—"
+    ntl_bar   = ""
+    if pd.notna(_ntl):
+        _ntl_f = float(_ntl)
+        ntl_label = (f"{_ntl_f:.0f} / 100 "
+                     f"({'high' if _ntl_f > 55 else 'moderate' if _ntl_f > 20 else 'low'})")
+        ntl_w = max(0, min(100, int(_ntl_f)))
+        ntl_bar = (f'<div style="background:#e8e8e8;border-radius:3px;height:5px;margin:2px 0 4px 0">'
+                   f'<div style="background:#f59e0b;width:{ntl_w}%;height:5px;border-radius:3px"></div></div>')
+
+    sinuosity_disp = f"{_sinuosity:.2f}" if pd.notna(_sinuosity) else "—"
+
+    infra_details = (
+        f'<details style="margin:4px 0">'
+        f'<summary style="cursor:pointer;color:#1a6fa8;font-size:12px;'
+        f'user-select:none;padding:3px 0;list-style:none;outline:none">'
+        f'&#9654; Road infrastructure</summary>'
+        f'<div style="padding:6px 2px 2px 2px;font-size:11px;color:#444;line-height:1.8">'
+        f'<table style="width:100%;border-collapse:collapse">'
+        f'<tr><td style="color:#888;width:45%">Lanes</td><td><b>{lanes_disp}</b></td>'
+        f'    <td style="color:#888">Direction</td><td><b>{oneway_disp}</b></td></tr>'
+        f'<tr><td style="color:#888">Surface</td><td><b>{surface_disp}</b></td>'
+        f'    <td style="color:#888">Lighting</td><td><b>{lit_disp}</b></td></tr>'
+        f'<tr><td style="color:#888">Junction</td><td><b>{junction_disp}</b></td>'
+        f'    <td style="color:#888">Sinuosity</td><td><b>{sinuosity_disp}</b></td></tr>'
+        f'</table>'
+        f'<div style="margin-top:6px;border-top:1px solid #eee;padding-top:5px">'
+        f'<span style="color:#888">Nighttime activity (VIIRS):</span> <b>{ntl_label}</b>'
+        f'{ntl_bar}</div>'
+        f'</div></details>'
+    )
+
+    # Exposure + Priority (collapsible)
+    exp_inner = ""
+    if pd.notna(exposure):
+        exp_inner = (
+            f'<div style="font-size:11px;color:#444;line-height:1.7">'
+            f'<b>Exposure: {fmt(exposure)}</b> / 100<br>'
+            f'&nbsp;School (12%): {fmt_dist(dist_school)}'
+            f'{"  ✓" if pd.notna(dist_school) and dist_school <= 500 else ""}<br>'
+            f'&nbsp;Hospital (8%): {fmt_dist(dist_hospital)}'
+            f'{"  ✓" if pd.notna(dist_hospital) and dist_hospital <= 750 else ""}<br>'
+            f'&nbsp;Population density (25%): {fmt(pop_density)} ppl/km²<br>'
+            f'&nbsp;Intersection density (20%): {fmt(int_score)} / 100<br>'
+            f'&nbsp;Traffic volume (35%): '
+            f'{f"{tv_component:.0f}th pctile" if pd.notna(tv_component) else "—"}'
+            f'</div>'
+        )
+    pi_inner = ""
+    if pd.notna(priority_index):
+        pi_bc = BAND_COLORS.get(priority_band, "#999")
+        pi_inner = (
+            f'<div style="margin-top:7px;font-size:11px;color:#444">'
+            f'<span style="background:{pi_bc};color:white;padding:2px 6px;'
+            f'border-radius:3px;font-size:10px">{priority_band}</span>'
+            f'  <b>Priority Index: {fmt(priority_index)}</b><br>'
+            f'&nbsp;Likelihood: {fmt(likelihood)} &nbsp;·&nbsp;'
+            f' Severity: {fmt(severity)} &nbsp;·&nbsp; Exposure: {fmt(exposure)}'
+            f'</div>'
+        )
+    exp_pi_details = (
+        f'<details style="margin:4px 0">'
+        f'<summary style="cursor:pointer;color:#1a6fa8;font-size:12px;'
+        f'user-select:none;padding:3px 0;list-style:none;outline:none">'
+        f'&#9654; Exposure &amp; priority</summary>'
+        f'<div style="padding:6px 2px 2px 2px">{exp_inner}{pi_inner}</div>'
+        f'</details>'
+    )
+
+    # Tier 1 notice
+    t1_html = ""
+    if pd.isna(sss) and pd.notna(align_only):
+        t1_bc = BAND_COLORS.get(align_only_band, "#999")
+        t1_html = (
+            f'<div style="background:{t1_bc};color:white;padding:4px 8px;'
+            f'border-radius:4px;margin:0 0 6px 0;font-size:11px">'
+            f'📏 Tier 1 only — no GPS speed data for this segment.<br>'
+            f'<span style="font-weight:normal">'
+            f'Alignment score: {fmt(align_only)} ({align_only_band})</span></div>'
+        )
+
+    img_html = ""
+    if img_url and isinstance(img_url, str) and img_url.startswith("http"):
+        img_html = (f'<div style="margin-top:7px">'
+                    f'<a href="{img_url}" target="_blank" '
+                    f'style="font-size:11px;color:#1a6fa8">📷 View street imagery</a>'
+                    f'</div>')
+
+    return (
+        f'<div style="font-family:Arial,sans-serif;width:360px;font-size:13px">'
+        f'<div style="background:{header_color};color:white;padding:8px 12px;'
+        f'border-radius:4px 4px 0 0;font-weight:bold;font-size:15px">'
+        f'{header_band} &nbsp;·&nbsp; {header_label}</div>'
+        f'<div style="padding:10px 12px;border:1px solid #ddd;border-top:none;'
+        f'border-radius:0 0 4px 4px;background:#fff">'
+        f'{t1_html}'
+        f'{speed_grid}'
+        f'{reason_html}'
+        f'{context_line}'
+        f'<hr style="margin:5px 0;border:none;border-top:1px solid #eee">'
+        f'{score_details}'
+        f'{infra_details}'
+        f'{exp_pi_details}'
+        f'{img_html}'
+        f'</div></div>'
+    )
+
+
+def _build_ml_popup_html(row: pd.Series) -> str:
+    """Rich popup for ML-predicted (no GPS) segments — mirrors Tier-1/2 layout."""
+    score = row.get("ml_predicted_sss", np.nan)
+    band  = row.get("ml_predicted_band", "Moderate")
+    img_url = row.get("image_url", "")
+    shap_feat = row.get("ml_shap_top_feature", "—")
+    rc    = row.get("road_class_norm", row.get("road_class", "—"))
+    lu    = row.get("land_use", "—")
+    ghsl_cls = row.get("ghsl_settlement_class", None)
+    country  = row.get("country", "—")
+
+    # Coerce numerics to plain float to avoid pandas nullable-type formatting issues
+    def _f(col, default=np.nan):
+        v = row.get(col, default)
+        try:
+            return float(v) if pd.notna(v) else np.nan
+        except (TypeError, ValueError):
+            return np.nan
+
+    sl   = _f("speed_limit")
+    ss   = _f("ss_limit")
+    conf = _f("ml_confidence")
+
+    header_color = BAND_COLORS.get(band, "#888")
+
+    def fmt(v, unit=""):
+        return f"{float(v):.1f}{unit}" if pd.notna(v) else "—"
+
+    # Speed grid — posted + SS limit; F85/median unavailable (no GPS)
+    gap_color = "#333"
+    if pd.notna(sl) and pd.notna(ss):
+        gap = sl - ss
+        if gap > 15:
+            gap_color = "#c0392b"
+        elif gap < -15:
+            gap_color = "#e67e22"
+
+    speed_grid = (
+        f'<table style="width:100%;border-collapse:separate;border-spacing:3px;margin:8px 0">'
+        f'<tr>'
+        f'<td style="padding:5px 8px;background:#f5f5f5;border-radius:4px;width:50%">'
+        f'<div style="color:#999;font-size:10px;text-transform:uppercase;letter-spacing:0.4px">Posted Limit</div>'
+        f'<div style="font-size:18px;font-weight:bold;color:#222">{fmt(sl)}'
+        f'<span style="font-size:11px;font-weight:normal;color:#888"> km/h</span></div></td>'
+        f'<td style="padding:5px 8px;background:#f5f5f5;border-radius:4px;width:50%">'
+        f'<div style="color:#999;font-size:10px;text-transform:uppercase;letter-spacing:0.4px">Safe System Limit</div>'
+        f'<div style="font-size:18px;font-weight:bold;color:{gap_color}">{fmt(ss)}'
+        f'<span style="font-size:11px;font-weight:normal;color:#888"> km/h</span></div></td>'
+        f'</tr><tr>'
+        f'<td style="padding:5px 8px;background:#f9f9f9;border-radius:4px;text-align:center" colspan="2">'
+        f'<div style="color:#999;font-size:10px;text-transform:uppercase;letter-spacing:0.4px">85th %ile / Median Speed</div>'
+        f'<div style="font-size:13px;color:#aaa;font-style:italic">No GPS data — model estimate</div>'
+        f'</td></tr></table>'
+    )
+
+    # Speed gap reason
+    reason_lines = []
+    if pd.notna(sl) and pd.notna(ss):
+        gap = sl - ss
+        if gap > 15:
+            reason_lines.append(f"Posted limit <b>{fmt(sl)} km/h</b> exceeds safe system limit by <b>{gap:.0f} km/h</b> — likely overposted.")
+        elif gap < -15:
+            reason_lines.append(f"Safe system limit <b>{fmt(ss)} km/h</b> exceeds posted limit — possible underposting.")
+        else:
+            reason_lines.append(f"Speed limit gap of <b>{abs(gap):.0f} km/h</b> — within tolerable range.")
+
+    cv_lamp = row.get("mapillary_street_lamp", np.nan)
+    cv_ped  = row.get("mapillary_ped_crossing", np.nan)
+    cv_guard= row.get("mapillary_guardrail", np.nan)
+    osm_lit = _stag(row, "osm_lit").lower()
+    if pd.notna(cv_ped) and float(cv_ped) > 0:
+        reason_lines.append(f"Mapillary: <b>{int(cv_ped)} pedestrian crossing(s)</b> detected nearby — elevated VRU risk.")
+    lit_ok = (pd.notna(cv_lamp) and float(cv_lamp) > 0) or (osm_lit in ("yes", "automatic", "24/7"))
+    if not lit_ok:
+        reason_lines.append("No confirmed street lighting — higher nighttime risk.")
+    if pd.notna(cv_guard) and float(cv_guard) > 0:
+        reason_lines.append(f"Mapillary: {int(cv_guard)} guardrail segment(s) detected.")
+
+    reason_html = ""
+    if reason_lines:
+        bullets = "".join(f'<li style="margin-bottom:3px">{r}</li>' for r in reason_lines)
+        reason_html = (
+            f'<div style="background:#fafafa;border-left:3px solid {header_color};'
+            f'padding:7px 10px;border-radius:0 4px 4px 0;margin:4px 0;font-size:12px;color:#333">'
+            f'<ul style="margin:0;padding-left:14px;line-height:1.5">{bullets}</ul></div>'
+        )
+
+    # Context
+    ghsl_label = (ghsl_cls.replace("_", " ").title()
+                  if ghsl_cls and str(ghsl_cls) not in ("nan", "None", "no_data") else lu)
+    context_line = (f'<div style="font-size:11px;color:#888;margin:2px 0 6px 0">'
+                    f'{rc} &nbsp;·&nbsp; {ghsl_label} &nbsp;·&nbsp; {country}</div>')
+
+    # SHAP / model details (collapsible)
+    conf_txt = f"{conf:.1f}" if pd.notna(conf) else "—"
+    shap_details = (
+        f'<details style="margin:4px 0">'
+        f'<summary style="cursor:pointer;color:#7c3aed;font-size:12px;'
+        f'user-select:none;padding:3px 0;list-style:none;outline:none">'
+        f'&#9654; Model details</summary>'
+        f'<div style="padding:6px 2px 2px 2px;font-size:11px;color:#444;line-height:1.7">'
+        f'<b>Top SHAP driver:</b> {shap_feat}<br>'
+        f'<b>Confidence (std):</b> {conf_txt} SSS points<br>'
+        f'<span style="color:#aaa">XGBoost trained on Tier-2 scored segments. '
+        f'Lower std = higher confidence.</span>'
+        f'</div></details>'
+    )
+
+    # Exposure (collapsible) if available
+    exposure      = row.get("exposure_score", np.nan)
+    dist_school   = row.get("dist_to_school_m", np.nan)
+    dist_hospital = row.get("dist_to_hospital_m", np.nan)
+    pop_density   = row.get("pop_density_500m", np.nan)
+    int_score     = row.get("intersection_score", np.nan)
+    exp_details = ""
+    if any(pd.notna(v) for v in [exposure, dist_school, dist_hospital, pop_density]):
+        def fmt_dist(v):
+            return f"{v:,.0f} m" if pd.notna(v) else "no data"
+        exp_details = (
+            f'<details style="margin:4px 0">'
+            f'<summary style="cursor:pointer;color:#1a6fa8;font-size:12px;'
+            f'user-select:none;padding:3px 0;list-style:none;outline:none">'
+            f'&#9654; Exposure context</summary>'
+            f'<div style="padding:6px 2px 2px 2px;font-size:11px;color:#444;line-height:1.7">'
+            f'{"<b>Exposure: " + fmt(exposure) + "</b> / 100<br>" if pd.notna(exposure) else ""}'
+            f'School: {fmt_dist(dist_school)}'
+            f'{"  ✓" if pd.notna(dist_school) and dist_school <= 500 else ""}<br>'
+            f'Hospital: {fmt_dist(dist_hospital)}'
+            f'{"  ✓" if pd.notna(dist_hospital) and dist_hospital <= 750 else ""}<br>'
+            f'Population density: {fmt(pop_density)} ppl/km²<br>'
+            f'Intersection density: {fmt(int_score)} / 100'
+            f'</div></details>'
+        )
+
+    # Street view link
+    img_html = ""
+    if img_url and isinstance(img_url, str) and img_url.startswith("http"):
+        img_html = (f'<div style="margin-top:7px">'
+                    f'<a href="{img_url}" target="_blank" '
+                    f'style="font-size:11px;color:#1a6fa8">📷 View street imagery</a>'
+                    f'</div>')
+
+    disclaimer = (
+        f'<div style="background:#fff8e1;border:1px solid #f59e0b;padding:5px 8px;'
+        f'border-radius:4px;font-size:11px;color:#92400e;margin-top:8px">'
+        f'⚠ Model estimate — no GPS speed data. Use for spatial prioritisation only.'
+        f'</div>'
+    )
+
+    return (
+        f'<div style="font-family:Arial,sans-serif;width:360px;font-size:13px">'
+        f'<div style="background:{header_color};color:white;padding:8px 12px;'
+        f'border-radius:4px 4px 0 0;font-weight:bold;font-size:15px">'
+        f'🤖 ML Predicted &nbsp;·&nbsp; {band} ({fmt(score)})</div>'
+        f'<div style="padding:10px 12px;border:1px solid #ddd;border-top:none;'
+        f'border-radius:0 0 4px 4px;background:#fff">'
+        f'{speed_grid}'
+        f'{reason_html}'
+        f'{context_line}'
+        f'<hr style="margin:5px 0;border:none;border-top:1px solid #eee">'
+        f'{shap_details}'
+        f'{exp_details}'
+        f'{img_html}'
+        f'{disclaimer}'
+        f'</div></div>'
+    )
 
 
 def _priority_sample(df: pd.DataFrame, max_n: int, band_col: str = "sss_band",
@@ -275,17 +671,9 @@ def build_interactive_map(
     # no API key. This is now the only/default base layer so "the whole
     # map in English" is guaranteed rather than one option among several
     # whose language behaviour isn't certain.
-    folium.TileLayer(
-        tiles="https://{s}.maps.wikimedia.org/osm-intl/{z}/{x}/{y}.png?lang=en",
-        attr="© OpenStreetMap contributors, © Wikimedia",
-        subdomains=["a", "b", "c"],
-        name="Light (English)",
-        max_zoom=19,
-    ).add_to(m)
-    # Dark theme kept as a secondary option. CartoDB's dark_matter style
-    # isn't guaranteed English the same explicit way as the layer above —
-    # if you need certainty on a non-default layer too, drop it and use
-    # only the English layer above.
+    # CartoDB Positron — very light/minimal base, maximises contrast with
+    # our coloured road lines. Set as default (first TileLayer added).
+    folium.TileLayer("CartoDB positron", name="Light").add_to(m)
     folium.TileLayer("CartoDB dark_matter", name="Dark").add_to(m)
 
     Fullscreen().add_to(m)
@@ -311,7 +699,9 @@ def build_interactive_map(
             sss    = row.get("sss", np.nan)
             band   = row.get("sss_band", "Acceptable")
             color  = score_to_color(sss)
-            weight = 3 if band in ("Critical", "High Risk") else 2
+            weight = (5 if band == "Critical"
+                      else 4 if band == "High Risk"
+                      else 3)
 
             popup_html  = _build_popup_html(row)
             tooltip_txt = f"{band} | SSS: {sss:.1f}" if pd.notna(sss) else "No data"
@@ -321,7 +711,7 @@ def build_interactive_map(
                     for seg_coords in _geom_to_latlon_list(geom):
                         folium.PolyLine(
                             locations=seg_coords, color=color, weight=weight,
-                            opacity=0.85,
+                            opacity=0.9,
                             popup=folium.Popup(popup_html, max_width=360),
                             tooltip=tooltip_txt,
                         ).add_to(fg)
@@ -654,30 +1044,20 @@ def build_interactive_map(
                 band  = row.get("ml_predicted_band", "Moderate")
                 color = BAND_COLORS.get(band, "#888888")
                 score = row.get("ml_predicted_sss", float("nan"))
-                shap_feat = row.get("ml_shap_top_feature", "—")
-                conf  = row.get("ml_confidence", float("nan"))
-                popup_html = (
-                    f"<b>ML Predicted SSS: {score:.1f}</b> ({band})<br>"
-                    f"Road class: {row.get('road_class_norm','—')} | "
-                    f"{row.get('land_use','—')}<br>"
-                    f"Posted: {row.get('speed_limit','—')} km/h | "
-                    f"SS limit: {row.get('ss_limit','—')} km/h<br>"
-                    f"Top driver: {shap_feat}<br>"
-                    f"Confidence (std): {conf:.1f}<br>"
-                    f"<i>Estimate only — no GPS data for this segment</i>"
-                )
+                popup_html = _build_ml_popup_html(row)
+                score_str = f"{score:.0f}" if pd.notna(score) else "—"
                 folium.PolyLine(
                     coords,
                     color=color,
                     weight=2,
                     opacity=0.6,
                     dash_array="6 4",
-                    popup=folium.Popup(popup_html, max_width=300),
-                    tooltip=f"ML: {score:.0f} ({band})",
+                    popup=folium.Popup(popup_html, max_width=380),
+                    tooltip=f"🤖 ML: {score_str} ({band})",
                 ).add_to(fg_ml)
             fg_ml.add_to(m)
 
-    folium.LayerControl(collapsed=True, position="topright").add_to(m)
+    folium.LayerControl(collapsed=False, position="topright").add_to(m)
     m.save(output_path)
     print(f"\nInteractive map saved: {output_path}")
     return m
@@ -699,31 +1079,42 @@ def _build_legend_html() -> str:
         for band, color in BAND_COLORS.items()
     )
     return f"""
-    <div style="position:fixed;bottom:40px;left:12px;z-index:9999;
+    <div id="legend-panel" style="position:fixed;bottom:40px;left:12px;z-index:9999;
                 background:rgba(30,30,30,0.92);color:white;
-                padding:14px 18px;border-radius:8px;font-family:Arial,sans-serif;
+                border-radius:8px;font-family:Arial,sans-serif;
                 font-size:13px;box-shadow:0 2px 12px rgba(0,0,0,0.4)">
-      <b style="font-size:14px">Speed Safety Score</b><br>
-      <hr style="border-color:#555;margin:6px 0">
-      {items}
-      <div style="margin-top:8px;display:flex;align-items:center">
-        <div style="width:12px;height:12px;background:#2563eb;border-radius:50%;margin-right:8px"></div>
-        <span style="font-size:12px">Schools</span>
+      <div style="display:flex;justify-content:space-between;align-items:center;
+                  padding:10px 14px 10px 18px;cursor:pointer"
+           onclick="(function(){{
+             var b=document.getElementById('legend-body');
+             var t=document.getElementById('legend-toggle');
+             if(b.style.display==='none'){{b.style.display='block';t.textContent='⊟';}}
+             else{{b.style.display='none';t.textContent='⊞';}}
+           }})()">
+        <b style="font-size:14px">Speed Safety Score</b>
+        <span id="legend-toggle" style="margin-left:14px;font-size:16px;line-height:1">⊟</span>
       </div>
-      <div style="margin-top:4px;display:flex;align-items:center">
-        <div style="width:12px;height:12px;background:#dc2626;border-radius:50%;margin-right:8px"></div>
-        <span style="font-size:12px">Hospitals</span>
+      <div id="legend-body" style="padding:0 18px 14px 18px">
+        <hr style="border-color:#555;margin:0 0 8px 0">
+        {items}
+        <div style="margin-top:8px;display:flex;align-items:center">
+          <div style="width:12px;height:12px;background:#2563eb;border-radius:50%;margin-right:8px"></div>
+          <span style="font-size:12px">Schools</span>
+        </div>
+        <div style="margin-top:4px;display:flex;align-items:center">
+          <div style="width:12px;height:12px;background:#dc2626;border-radius:50%;margin-right:8px"></div>
+          <span style="font-size:12px">Hospitals</span>
+        </div>
+        <div style="margin-top:8px;display:flex;align-items:center">
+          <div style="width:12px;height:3px;background:#7c3aed;margin-right:8px;
+                      border-top:2px dashed #7c3aed"></div>
+          <span style="font-size:12px">Blindspot (high SSS + no imagery)</span>
+        </div>
+        <div style="color:#aaa;font-size:11px;margin-top:8px">
+          Same color scale for SSS and Priority Index layers
+        </div>
+        <div style="color:#aaa;font-size:11px;margin-top:6px">AI for Safer Roads · ADB Challenge</div>
       </div>
-      <div style="margin-top:8px;display:flex;align-items:center">
-        <div style="width:12px;height:3px;background:#7c3aed;margin-right:8px;
-                    border-top:2px dashed #7c3aed"></div>
-        <span style="font-size:12px">Blindspot (high SSS + no imagery)</span>
-      </div>
-      <div style="color:#aaa;font-size:11px;margin-top:8px">
-        Same color scale used for both SSS (default view) and Priority Index<br>
-        (toggle "🎯 Priority Index View" in layer control to compare)
-      </div>
-      <div style="color:#aaa;font-size:11px;margin-top:6px">AI for Safer Roads · ADB Challenge</div>
     </div>
     """
 
@@ -738,25 +1129,37 @@ def _build_methodology_html() -> str:
     return f"""
     <div id="methodology-panel" style="position:fixed;bottom:40px;right:12px;z-index:9999;
                 max-width:300px;background:rgba(30,30,30,0.92);color:white;
-                padding:12px 16px;border-radius:8px;font-family:Arial,sans-serif;
+                border-radius:8px;font-family:Arial,sans-serif;
                 font-size:12px;box-shadow:0 2px 12px rgba(0,0,0,0.4)">
-      <b style="font-size:13px">How Exposure is calculated</b>
-      <hr style="border-color:#555;margin:6px 0">
-      <div style="color:#ccc;line-height:1.5">
-        <b>Schools (12%):</b> distance from road to nearest school point
-        (HOTOSM data), decaying to 0 at 2× the 500m reference buffer.<br>
-        <b>Hospitals (8%):</b> same decay, 750m reference buffer.<br>
-        <b>Population (25%):</b> WorldPop density sampled along a 500m
-        road buffer, then percentile-ranked within country.<br>
-        <b>Intersections (20%):</b> OSM junction count within a 1km
-        buffer, per km of road.<br>
-        <b>Traffic volume (35%):</b> GPS probe sample count
-        (WeightedSample), percentile-ranked within country.
+      <div style="display:flex;justify-content:space-between;align-items:center;
+                  padding:10px 12px 10px 16px;cursor:pointer"
+           onclick="(function(){{
+             var b=document.getElementById('methodology-body');
+             var t=document.getElementById('methodology-toggle');
+             if(b.style.display==='none'){{b.style.display='block';t.textContent='⊟';}}
+             else{{b.style.display='none';t.textContent='⊞';}}
+           }})()">
+        <b style="font-size:13px">How Exposure is calculated</b>
+        <span id="methodology-toggle" style="margin-left:14px;font-size:16px;line-height:1">⊟</span>
       </div>
-      <div style="color:#888;font-size:10px;margin-top:8px">
-        Click any road segment for that segment's actual input values.
-        Weights with no data in a given run are dropped and the remaining
-        weights are redistributed proportionally (see enrichment.py).
+      <div id="methodology-body" style="padding:0 16px 12px 16px">
+        <hr style="border-color:#555;margin:0 0 8px 0">
+        <div style="color:#ccc;line-height:1.5">
+          <b>Schools (12%):</b> distance from road to nearest school point
+          (HOTOSM data), decaying to 0 at 2× the 500m reference buffer.<br>
+          <b>Hospitals (8%):</b> same decay, 750m reference buffer.<br>
+          <b>Population (25%):</b> WorldPop density sampled along a 500m
+          road buffer, then percentile-ranked within country.<br>
+          <b>Intersections (20%):</b> OSM junction count within a 1km
+          buffer, per km of road.<br>
+          <b>Traffic volume (35%):</b> GPS probe sample count
+          (WeightedSample), percentile-ranked within country.
+        </div>
+        <div style="color:#888;font-size:10px;margin-top:8px">
+          Click any road segment for that segment's actual input values.
+          Weights with no data in a given run are dropped and the remaining
+          weights are redistributed proportionally (see enrichment.py).
+        </div>
       </div>
     </div>
     """
@@ -837,17 +1240,21 @@ def _build_summary_html(scored: gpd.GeoDataFrame, full_gdf: gpd.GeoDataFrame,
             )
 
     return f"""
-    <div id="summary-panel" style="position:fixed;top:52px;right:12px;z-index:9990;
+    <div id="summary-panel" style="position:fixed;top:52px;left:12px;z-index:9990;
                 background:rgba(30,30,30,0.92);color:white;
                 padding:10px 14px;border-radius:8px;font-family:Arial,sans-serif;
                 font-size:12px;box-shadow:0 2px 12px rgba(0,0,0,0.4);min-width:220px;
                 max-height:80vh;overflow-y:auto">
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+      <div style="display:flex;justify-content:space-between;align-items:center;
+                  margin-bottom:4px;cursor:pointer"
+           onclick="(function(){{
+             var b=document.getElementById('summary-body');
+             var t=document.getElementById('summary-toggle');
+             if(b.style.display==='none'){{b.style.display='block';t.textContent='⊟';}}
+             else{{b.style.display='none';t.textContent='⊞';}}
+           }})()">
         <b style="font-size:13px">Analysis Summary</b>
-        <span onclick="var b=document.getElementById('summary-body');
-                       b.style.display=b.style.display=='none'?'block':'none'"
-              style="cursor:pointer;font-size:16px;line-height:1;padding:0 4px"
-              title="Collapse/expand">⊟</span>
+        <span id="summary-toggle" style="font-size:16px;line-height:1;padding:0 4px">⊟</span>
       </div>
       <div id="summary-body">
       <hr style="border-color:#555;margin:4px 0">

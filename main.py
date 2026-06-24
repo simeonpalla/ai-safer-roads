@@ -394,9 +394,30 @@ def main():
     # does not replace it. See priority_scoring.py module docstring.
     combined = run_priority_scoring(combined)
 
-    # ML coverage extension — predicts SSS for unscored segments
+    # CV enrichment (feature columns only — no score changes yet).
+    # Run on ALL segments so unscored roads also get mapillary_ped_crossing,
+    # mapillary_street_lamp etc. as ML input features.
+    # No segment_mask: full network. cv_grid_cache.json keeps repeat runs instant.
+    if mapillary_token:
+        from mapillary_features import enrich_with_mapillary_cv, apply_mapillary_cv_to_scoring
+        print("\n[Mapillary CV] Extracting computer vision detections (full network)...")
+        combined = enrich_with_mapillary_cv(
+            combined,
+            token=mapillary_token,
+            cache_dir=str(BASE_DIR / "enrichment_data" / "mapillary_cache"),
+            segment_mask=None,
+        )
+
+    # ML extension — runs AFTER CV feature enrichment (so CV columns are available
+    # as model inputs) but BEFORE CV scoring amplification (so training labels are
+    # the pre-amplification SSS — cleaner signal, R² ~0.877 vs ~0.785).
     if not args.no_ml and not args.demo:
         combined = run_ml_extension(combined, output_dir=args.out)
+
+    # CV scoring amplification — applied LAST so ML trains on pre-amplification
+    # labels. Modifies sub-scores for scored segments with ped crossings / lamps.
+    if mapillary_token:
+        combined = apply_mapillary_cv_to_scoring(combined)
 
     # Print human-readable policy summary
     print_policy_summary(combined, corridors)

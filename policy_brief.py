@@ -469,7 +469,7 @@ def export_policy_brief(
         def autofit(ws, df_s, max_w=55):
             for col_idx, col in enumerate(df_s.columns, start=1):
                 vals = df_s[col].astype(str).str.len()
-                best = max(len(str(col)), int(vals.max()) if len(vals) else 0)
+                best = max(len(str(col)), int(vals.max()) if len(vals) and vals.notna().any() else 0)
                 ws.column_dimensions[get_column_letter(col_idx)].width = min(best + 2, max_w)
 
         def freeze_and_filter(ws):
