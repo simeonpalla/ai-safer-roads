@@ -246,10 +246,12 @@ def score_infrastructure_severity(gdf: gpd.GeoDataFrame) -> pd.Series:
         matched |= m
 
     n_matched = int(matched.sum())
-    print(f"  [Severity] {n_matched:,} / {len(gdf):,} segments "
-          f"({100*n_matched/max(len(gdf),1):.1f}%) have observed OSM "
-          f"infrastructure data; remaining segments use the "
-          f"ROAD_CLASS_SEVERITY_MAP assumption alone.")
+    if getattr(score_infrastructure_severity, "_printed", False) is False:
+        print(f"  [Severity] {n_matched:,} / {len(gdf):,} segments "
+              f"({100*n_matched/max(len(gdf),1):.1f}%) have observed OSM "
+              f"infrastructure data; remaining segments use the "
+              f"ROAD_CLASS_SEVERITY_MAP assumption alone.")
+        score_infrastructure_severity._printed = True
 
     return (prior + adj).clip(0, 100)
 

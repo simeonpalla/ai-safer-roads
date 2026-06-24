@@ -19,6 +19,11 @@ from shapely.geometry import MultiPoint
 
 warnings.filterwarnings("ignore")
 
+from config import (
+    SPEED_BUMP_F85_THRESHOLD, SPEED_BUMP_MEDIAN_THRESHOLD, SPEED_BUMP_SPREAD_THRESHOLD,
+    NILSSON_EXPONENT_CENTRAL, NILSSON_EXPONENT_LOW, NILSSON_EXPONENT_HIGH,
+)
+
 # ── WHO regional fatality rates per billion vehicle-km ────────────────────────
 # Source: WHO Global Status Report on Road Safety 2023
 WHO_FATALITY_RATE = {"MH": 8.5, "TH": 6.2, "default": 7.0}
@@ -38,23 +43,34 @@ VKM_PER_WEIGHTED_SAMPLE = 1.0
 
 def nilsson(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     """
-    Fatal crash risk = (observed_speed / safe_speed)^4
-    Serious injury  = (observed_speed / safe_speed)^3
+    Fatal crash risk = (observed_speed / safe_speed) ^ exponent
 
-    observed_speed = F85th percentile (what drivers actually do)
-    safe_speed     = Safe System threshold for this road type
+    CANONICAL: exponent = 4.0 (Nilsson 2004, cited in WHO Speed Management).
+    ASIAN CONTEXT: the canonical exponent was derived from Scandinavian
+    homogeneous car traffic. For South/SE Asian mixed traffic on undivided
+    rural roads, re-analysis (Elvik 2009 meta-analysis; Imprialou & Quddus
+    2019) suggests the exponent ranges 3.5–5.0. This function reports a
+    LOW / CENTRAL / HIGH range rather than a single point estimate, treating
+    the exponent as an honest uncertainty parameter.
 
-    ratio = 1.0 → at baseline
-    ratio = 2.0 → double the fatal crash risk
-    ratio = 6.5 → Thailand urban secondary (80 km/h limit, 100 km/h actual)
+    Columns added:
+        nilsson_fatal_ratio          — central estimate (exponent=4.0)
+        nilsson_fatal_ratio_low      — lower bound (exponent=3.5)
+        nilsson_fatal_ratio_high     — upper bound (exponent=5.0)
+        nilsson_injury_ratio         — central (exponent=3.0)
+        nilsson_fatal_pct_excess     — % above baseline, central
+        nilsson_interpretation       — text label
     """
     gdf  = gdf.copy()
     mask = gdf["scoreable"] & gdf["speed_85th"].notna() & gdf["ss_limit"].notna()
     obs  = gdf.loc[mask, "speed_85th"]
     safe = gdf.loc[mask, "ss_limit"].replace(0, np.nan)
+    ratio = obs / safe
 
-    gdf.loc[mask, "nilsson_fatal_ratio"]      = (obs / safe) ** 4
-    gdf.loc[mask, "nilsson_injury_ratio"]     = (obs / safe) ** 3
+    gdf.loc[mask, "nilsson_fatal_ratio"]      = ratio ** NILSSON_EXPONENT_CENTRAL
+    gdf.loc[mask, "nilsson_fatal_ratio_low"]  = ratio ** NILSSON_EXPONENT_LOW
+    gdf.loc[mask, "nilsson_fatal_ratio_high"] = ratio ** NILSSON_EXPONENT_HIGH
+    gdf.loc[mask, "nilsson_injury_ratio"]     = ratio ** 3.0
     gdf.loc[mask, "nilsson_fatal_pct_excess"] = (
         (gdf.loc[mask, "nilsson_fatal_ratio"] - 1) * 100
     ).clip(lower=0)
@@ -77,6 +93,9 @@ def nilsson(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
           f"{gdf.loc[mask,'nilsson_fatal_ratio'].min():.2f} – {mx:.2f}")
     print(f"  Segments with >2x fatal risk: {n2:,}")
     print(f"  Segments with >4x fatal risk: {n4:,}")
+    print(f"  Exponent uncertainty (Asian mixed traffic): "
+          f"low={NILSSON_EXPONENT_LOW}, central={NILSSON_EXPONENT_CENTRAL}, "
+          f"high={NILSSON_EXPONENT_HIGH}")
     return gdf
 
 
@@ -90,38 +109,76 @@ def credibility(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     A limit is credible when 85th pct speed ≤ posted limit + 10 km/h.
     Non-credible limits are dangerous: drivers learn to ignore ALL signage.
 
-    Credible        → gap ≤ 10 km/h
-    Low Credibility → gap 11–20 km/h
-    Non-Credible    → gap > 20 km/h   (limit effectively ignored)
-    Under-Speed     → 85th < limit - 10 (poor road condition / heavy trucks)
+    Standard classification (AASHTO/TRL):
+        Credible        → gap ≤ 10 km/h
+        Low Credibility → gap 11–20 km/h
+        Non-Credible    → gap > 20 km/h   (limit effectively ignored)
+        Under-Speed     → 85th < limit - 10 (poor road condition / heavy trucks)
+
+    ASIAN CONTEXT — Speed Bump Detection:
+        In Thailand and Maharashtra, informal speed bumps are the primary
+        traffic calming mechanism on urban/peri-urban tertiary and secondary
+        roads. A bump-forced road shows a characteristic GPS signature:
+          F85 ≤ 35 km/h AND median ≤ 28 km/h AND spread ≤ 8 km/h
+        This would otherwise be classified "Under-Speed" with the recommendation
+        "investigate road condition" — which is partially right, but the
+        root cause is INFRASTRUCTURE (bumps), not geometry or traffic composition.
+        These are separately labelled "Infrastructure-Forced" so the action
+        recommendation is "verify speed bump presence" rather than "raise limit".
+        Thresholds from IRC:99-1988 (India) and DRR Thailand Technical Standard
+        2019 speed hump design speeds.
     """
     gdf  = gdf.copy()
     mask = gdf["scoreable"] & gdf["speed_85th"].notna() & gdf["speed_limit"].notna()
     gap  = gdf.loc[mask, "speed_85th"] - gdf.loc[mask, "speed_limit"]
     gdf.loc[mask, "credibility_gap"] = gap.round(1)
 
-    def _class(g):
-        if pd.isna(g):  return "No data"
-        if g < -10:     return "Under-Speed"
-        if g <= 10:     return "Credible"
-        if g <= 20:     return "Low Credibility"
-        return          "Non-Credible"
+    # Speed-bump signature: low F85, low median, tight spread
+    has_median = "median_speed" in gdf.columns
+    if has_median:
+        spread = (gdf.loc[mask, "speed_85th"] - gdf.loc[mask, "median_speed"]).fillna(999)
+        bump_pattern = (
+            (gdf.loc[mask, "speed_85th"]   <= SPEED_BUMP_F85_THRESHOLD) &
+            (gdf.loc[mask, "median_speed"] <= SPEED_BUMP_MEDIAN_THRESHOLD) &
+            (spread                         <= SPEED_BUMP_SPREAD_THRESHOLD)
+        )
+    else:
+        bump_pattern = pd.Series(False, index=gdf.loc[mask].index)
 
-    def _action(g):
-        if pd.isna(g):  return ""
-        if g < -10:     return "Investigate road condition / traffic composition"
-        if g <= 10:     return "Maintain enforcement"
-        if g <= 20:     return "Increase enforcement or add physical calming"
-        return          "Limit reform required — signage is not working"
+    def _class(idx, g):
+        if pd.isna(g):
+            return "No data"
+        if bump_pattern.get(idx, False):
+            return "Infrastructure-Forced"
+        if g < -10:   return "Under-Speed"
+        if g <= 10:   return "Credible"
+        if g <= 20:   return "Low Credibility"
+        return        "Non-Credible"
 
-    gdf.loc[mask, "credibility_class"]       = gap.apply(_class)
-    gdf.loc[mask, "credibility_intervention"]= gap.apply(_action)
+    def _action(idx, g):
+        if pd.isna(g):
+            return ""
+        if bump_pattern.get(idx, False):
+            return ("Probable speed infrastructure (bumps/tables) forcing low speeds — "
+                    "verify on-site before recommending limit change")
+        if g < -10:   return "Investigate road condition / traffic composition"
+        if g <= 10:   return "Maintain enforcement"
+        if g <= 20:   return "Increase enforcement or add physical calming"
+        return        "Limit reform required — signage is not working"
+
+    gdf.loc[mask, "credibility_class"]        = [_class(i, g) for i, g in gap.items()]
+    gdf.loc[mask, "credibility_intervention"] = [_action(i, g) for i, g in gap.items()]
 
     print(f"\n  Credibility breakdown:")
     counts = gdf.loc[mask, "credibility_class"].value_counts()
     total  = counts.sum()
     for label, n in counts.items():
-        print(f"    {label:<20} {n:>6,}  ({100*n/total:.1f}%)")
+        print(f"    {label:<25} {n:>6,}  ({100*n/total:.1f}%)")
+    if has_median:
+        n_bump = int(bump_pattern.sum())
+        print(f"  ↳ Infrastructure-Forced (speed bump pattern): {n_bump:,} segments")
+        print(f"    (F85 ≤ {SPEED_BUMP_F85_THRESHOLD} AND median ≤ {SPEED_BUMP_MEDIAN_THRESHOLD} "
+              f"AND spread ≤ {SPEED_BUMP_SPREAD_THRESHOLD} km/h)")
     return gdf
 
 
@@ -166,6 +223,16 @@ def recommend_limit(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         gdf.loc[mask, "limit_change_needed"].apply(_effort)
     )
 
+    # Under-Speed: F85 far below posted limit → poor surface, heavy trucks, bad geometry.
+    # floor(F85/10)*10 gives nonsensical recommendations (e.g. 20 km/h on a rural trunk).
+    # The right response is investigation, not a lower limit.
+    if "credibility_class" in gdf.columns:
+        under_speed = mask & (gdf["credibility_class"] == "Under-Speed")
+        if under_speed.any():
+            gdf.loc[under_speed, "recommended_limit"]   = np.nan
+            gdf.loc[under_speed, "limit_change_needed"] = np.nan
+            gdf.loc[under_speed, "change_effort"]       = "Investigate road condition"
+
     print(f"\n  Limit change effort breakdown:")
     counts = gdf.loc[mask, "change_effort"].value_counts()
     total  = counts.sum()
@@ -193,11 +260,17 @@ def lives_saved(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     Method:
       1. Traffic proxy: WeightedSample * VKM_PER_WEIGHTED_SAMPLE = annual vkm
       2. Current fatalities = vkm / 1e9 * WHO regional rate
-      3. Risk reduction = 1 - (recommended/observed)^4  [Nilsson]
+      3. Risk reduction = 1 - (recommended/observed)^exponent  [Nilsson]
       4. Lives saved = current_fatalities * risk_reduction
 
-    Uncertainty: central ± factor of 2 (50% / 200% bounds)
-    NOTE: ORDER-OF-MAGNITUDE proxy. All assumptions documented.
+    ASIAN CONTEXT — Exponent uncertainty:
+      The canonical exponent (4.0) was calibrated on Scandinavian homogeneous
+      traffic. For South/SE Asian mixed-traffic undivided roads, Elvik (2009)
+      and Imprialou & Quddus (2019) suggest 3.5–5.0. This function reports
+      LOW (3.5), CENTRAL (4.0), and HIGH (5.0) estimates so the uncertainty
+      from the exponent choice is explicit rather than hidden in a single number.
+      The existing ±50%/±200% sampling uncertainty is retained as an ADDITIONAL
+      source of uncertainty, not a replacement for the exponent range.
     """
     gdf = gdf.copy()
 
@@ -222,23 +295,40 @@ def lives_saved(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     current = (vkm / 1e9) * rate
     gdf.loc[mask, "est_current_fatalities"] = current.round(4)
 
-    risk_ratio   = ((rec / obs) ** 4).clip(upper=1.0)
-    risk_reduct  = (1 - risk_ratio).clip(lower=0)
-    central      = current * risk_reduct
+    # Central estimate (exponent=4.0)
+    ratio_central = ((rec / obs) ** NILSSON_EXPONENT_CENTRAL).clip(upper=1.0)
+    central = (current * (1 - ratio_central).clip(lower=0))
 
-    gdf.loc[mask, "est_lives_saved"]   = central.round(4)
+    # Low estimate (exponent=3.5 — homogeneous traffic assumption)
+    ratio_low  = ((rec / obs) ** NILSSON_EXPONENT_LOW).clip(upper=1.0)
+    lives_low  = (current * (1 - ratio_low).clip(lower=0))
+
+    # High estimate (exponent=5.0 — undivided mixed-traffic Asian roads)
+    ratio_high  = ((rec / obs) ** NILSSON_EXPONENT_HIGH).clip(upper=1.0)
+    lives_high  = (current * (1 - ratio_high).clip(lower=0))
+
+    gdf.loc[mask, "est_lives_saved"]          = central.round(4)
+    gdf.loc[mask, "est_lives_saved_exp_low"]  = lives_low.round(4)
+    gdf.loc[mask, "est_lives_saved_exp_high"] = lives_high.round(4)
+    # Retain sampling uncertainty bounds on the central estimate
     gdf.loc[mask, "lives_saved_lower"] = (central * 0.5).round(4)
     gdf.loc[mask, "lives_saved_upper"] = (central * 2.0).round(4)
 
     print(f"\n  ── Lives Saved Estimates (study area, annual) ──")
     print(f"  Est. current annual fatalities (proxy): {current.sum():.1f}")
-    print(f"  Est. lives saved if limits corrected:   {central.sum():.1f}")
-    print(f"  Uncertainty range:                      {central.sum()*0.5:.1f} – {central.sum()*2.0:.1f}")
+    print(f"  Est. lives saved — central (exponent={NILSSON_EXPONENT_CENTRAL}): "
+          f"{central.sum():.1f}")
+    print(f"  Exponent uncertainty range:")
+    print(f"    Low  (exp={NILSSON_EXPONENT_LOW}, homogeneous traffic): "
+          f"{lives_low.sum():.1f}")
+    print(f"    High (exp={NILSSON_EXPONENT_HIGH}, Asian mixed traffic): "
+          f"{lives_high.sum():.1f}")
+    print(f"  Sampling uncertainty (±50%/200% on central): "
+          f"{central.sum()*0.5:.1f} – {central.sum()*2.0:.1f}")
     print(f"  ⚠ NOT VALIDATED — VKM_PER_WEIGHTED_SAMPLE (config.py) is an")
-    print(f"    unverified placeholder bridging GPS-probe sample counts to")
-    print(f"    vehicle-km. This number scales linearly with that constant;")
-    print(f"    treat as illustrative/relative ranking, not a precise public figure,")
-    print(f"    until that conversion is verified against ADB's WeightedSample definition.")
+    print(f"    unverified placeholder. Exponent range reflects Asian mixed-traffic")
+    print(f"    uncertainty (Elvik 2009; Imprialou & Quddus 2019). Use for")
+    print(f"    RELATIVE comparison across segments, not as a precise public figure.")
     return gdf
 
 

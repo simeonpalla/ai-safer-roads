@@ -63,6 +63,7 @@ TH_COLUMN_ALIASES = {
     "InvPercentile":         "inv_percentile",
     "ProvinceID":            "province_id",
     "AnalysisStatus":        "analysis_status",
+    "ExcludeFromSpeedSPI":   "exclude_flag",
     "StreetImageLink":       "image_url",
     "NO_OF_Result_Segments": "n_result_segments",
     "SampleSizeTotal":       "sample_size_total",
@@ -81,6 +82,32 @@ def _normalize_land_use(series: pd.Series) -> pd.Series:
         series.astype(str).str.lower().str.strip()
         .map(LAND_USE_MAP).fillna("unknown")
     )
+
+
+def _bbox_to_streetview_url(raw: str) -> str:
+    """
+    StreetImageLink in both ADB GeoJSONs stores segment endpoint coordinates as
+    "lon1,lat1,lon2,lat2" (per the ADB data guide: "Lat/Lon for Google StreetView").
+    Convert to a Google Maps Street View URL centred on the midpoint.
+    No API key required for this URL format.
+    Returns empty string if the value can't be parsed.
+    """
+    if not isinstance(raw, str) or not raw.strip():
+        return ""
+    try:
+        parts = [float(x) for x in raw.split(",")]
+        if len(parts) == 4:
+            lon = (parts[0] + parts[2]) / 2
+            lat = (parts[1] + parts[3]) / 2
+        elif len(parts) == 2:
+            lon, lat = parts
+        else:
+            return ""
+        if not (-90 <= lat <= 90) or not (-180 <= lon <= 180):
+            return ""
+        return f"https://maps.google.com/maps?layer=c&cbll={lat:.6f},{lon:.6f}"
+    except (ValueError, TypeError):
+        return ""
 
 
 def _parse_speed_limit(series: pd.Series) -> pd.Series:
@@ -124,11 +151,7 @@ def load_maharashtra(filepath: str) -> gpd.GeoDataFrame:
     # Speed limit
     if "speed_limit_raw" in gdf.columns:
         gdf["speed_limit"] = _parse_speed_limit(gdf["speed_limit_raw"])
-    if "speed_limit_floor" in gdf.columns and "speed_limit" in gdf.columns:
-        # Fill any remaining NaN speed_limit from floor
-        gdf["speed_limit"] = gdf["speed_limit"].fillna(
-            pd.to_numeric(gdf["speed_limit_floor"], errors="coerce")
-        )
+    # SpeedLimitFloor fallback removed — data user guide says ignore this field.
 
     # Road class + land use
     if "road_class" in gdf.columns:
@@ -179,10 +202,7 @@ def load_thailand(filepath: str) -> gpd.GeoDataFrame:
     # Speed limit
     if "speed_limit_raw" in gdf.columns:
         gdf["speed_limit"] = pd.to_numeric(gdf["speed_limit_raw"], errors="coerce")
-    if "speed_limit_floor" in gdf.columns:
-        gdf["speed_limit"] = gdf.get("speed_limit", pd.Series(dtype=float)).fillna(
-            pd.to_numeric(gdf["speed_limit_floor"], errors="coerce")
-        )
+    # SpeedLimitFloor fallback removed — data user guide says ignore this field.
 
     if "road_class" in gdf.columns:
         gdf["road_class_norm"] = _normalize_road_class(gdf["road_class"])
@@ -192,11 +212,9 @@ def load_thailand(filepath: str) -> gpd.GeoDataFrame:
     # ── KEY FIX: derive has_speed_data from actual column content ──────────
     gdf["has_speed_data"] = _derive_has_speed_data(gdf)
 
-    # Also set using ForAnalysis if available (as secondary check)
-    if "for_analysis" in gdf.columns:
-        fa = pd.to_numeric(gdf["for_analysis"], errors="coerce")
-        gdf["has_speed_data"] = gdf["has_speed_data"] | (fa == 1)
-        print(f"  for_analysis == 1 count: {(fa == 1).sum()}")
+    # ForAnalysis in the TH GeoJSON contains speed-limit-like values (30/50/80/90 km/h),
+    # NOT a binary 0/1 flag. The column-content check in _derive_has_speed_data() is the
+    # correct authority for has_speed_data; no secondary check needed here.
 
     n_speed = gdf["has_speed_data"].sum()
     n_limit = gdf["speed_limit"].notna().sum() if "speed_limit" in gdf.columns else 0
@@ -220,7 +238,7 @@ def merge_datasets(mh: gpd.GeoDataFrame, th: gpd.GeoDataFrame) -> gpd.GeoDataFra
         "pct_over_limit", "n_over_limit",
         "sample_size", "sample_size_total", "weighted_sample",
         "ranked_percentile", "percentile_band",
-        "analysis_status", "has_speed_data",
+        "analysis_status", "exclude_flag", "has_speed_data",
         "image_url", "geometry",
     ]
     for col in ["urban_pct", "province_id", "road_length_m"]:
@@ -238,6 +256,11 @@ def merge_datasets(mh: gpd.GeoDataFrame, th: gpd.GeoDataFrame) -> gpd.GeoDataFra
         pd.concat([_keep(mh), _keep(th)], ignore_index=True),
         crs="EPSG:4326"
     )
+
+    # Convert raw StreetImageLink bbox coords to Google Street View URLs
+    if "image_url" in combined.columns:
+        mask = combined["image_url"].notna() & ~combined["image_url"].astype(str).str.startswith("http")
+        combined.loc[mask, "image_url"] = combined.loc[mask, "image_url"].apply(_bbox_to_streetview_url)
 
     # Diagnostic
     print(f"\nCombined dataset: {len(combined):,} total segments")
@@ -299,8 +322,23 @@ def get_analysis_subset(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
     has_median     = gdf["median_speed"].notna() if "median_speed" in gdf.columns \
                      else pd.Series(True, index=gdf.index)
 
-    gdf["scoreable"]            = has_speed_data & has_limit & has_85th
-    gdf["alignment_scoreable"]  = has_limit   # Tier 1 — posted limit alone
+    # Honour ADB's ExcludeFromSpeedSPI flag — MH is 0/1 numeric, TH may be "YES"/"NO" string
+    if "exclude_flag" in gdf.columns:
+        excl = gdf["exclude_flag"]
+        not_excluded = ~(
+            (excl == 1) |
+            (excl.astype(str).str.upper().isin(["YES", "1", "TRUE"]))
+        )
+        not_excluded = not_excluded.fillna(True)  # NaN = no flag = not excluded
+    else:
+        not_excluded = pd.Series(True, index=gdf.index)
+
+    # ExcludeFromSpeedSPI is ADB's flag for speed-behaviour data quality issues.
+    # Tier 2 (full SSS uses F85/median speed) → respect the flag.
+    # Tier 1 (alignment-only, posted limit vs Safe System standard, no speed data) → ignore it;
+    # a bad speed sample doesn't make the posted limit invalid.
+    gdf["scoreable"]           = has_speed_data & has_limit & has_85th & not_excluded
+    gdf["alignment_scoreable"] = has_limit  # Tier 1 — posted limit alone, flag irrelevant
 
     # Diagnostic breakdown
     n_zero_limit = int((gdf["speed_limit"] == 0).sum()) if "speed_limit" in gdf.columns else 0

@@ -56,6 +56,11 @@ warnings.filterwarnings("ignore")
 
 SCHOOL_BUFFER_M    = 500
 HOSPITAL_BUFFER_M  = 750
+MARKET_BUFFER_M    = 400   # markets/bazaars — heavy pedestrian footfall
+TRANSIT_BUFFER_M   = 300   # bus stops/stations — crossing hotspots
+RELIGIOUS_BUFFER_M = 400   # temples/mosques — periodic large crowds
+UNIVERSITY_BUFFER_M = 500  # universities/colleges — dense commuter cycling/motorcycling
+CROSSINGS_BUFFER_M = 200   # railway level crossings — extreme fatality risk point
 INTERSECTION_BUFFER_M = 1000
 WORLDPOP_BUFFER_M  = 500
 
@@ -277,7 +282,7 @@ def match_road_infrastructure(
 
     gdf_m   = gdf.to_crs(epsg=3857)
     infra_m = infra.to_crs(epsg=3857)
-    keep_cols = [c for c in ["lanes", "oneway", "surface", "lit", "junction"] if c in infra_m.columns]
+    keep_cols = [c for c in ["lanes", "oneway", "surface", "lit", "junction", "highway"] if c in infra_m.columns]
 
     try:
         joined = gpd.sjoin_nearest(
@@ -450,6 +455,11 @@ def compute_exposure_score(
     hospitals: pd.Series,
     traffic_volume: pd.Series = None,
     country_code: pd.Series = None,
+    markets: pd.Series = None,
+    transit: pd.Series = None,
+    religious: pd.Series = None,
+    university: pd.Series = None,
+    crossings: pd.Series = None,
 ) -> pd.Series:
     """
     Combine all exposure layers into a single 0–100 Exposure Score.
@@ -496,6 +506,21 @@ def compute_exposure_score(
         tv_norm = _percentile_normalize(traffic_volume, group=country_code)
         components["traffic_volume"] = tv_norm
 
+    if markets is not None:
+        components["markets"] = markets.astype(float).fillna(0)
+
+    if transit is not None:
+        components["transit"] = transit.astype(float).fillna(0)
+
+    if religious is not None:
+        components["religious"] = religious.astype(float).fillna(0)
+
+    if university is not None:
+        components["university"] = university.astype(float).fillna(0)
+
+    if crossings is not None:
+        components["crossings"] = crossings.astype(float).fillna(0)
+
     # Drop components with literally no signal (every value 0) — a real
     # all-zero exposure layer would be suspicious; far more likely it's an
     # enrichment file that was never built.
@@ -527,15 +552,20 @@ def enrich_segments(
     Main entry point.
 
     Adds columns:
-        pop_density_500m         — WorldPop along road buffer
-        near_school               — bool: road within 500m of school (display only)
-        near_hospital             — bool: road within 750m of hospital (display only)
-        dist_to_school_m          — distance to NEAREST school, metres (calc. transparency)
-        dist_to_hospital_m        — distance to NEAREST hospital, metres (calc. transparency)
-        school_proximity_score    — 0–100: continuous decay, feeds Exposure
-        hospital_proximity_score  — 0–100: continuous decay, feeds Exposure
-        intersection_score        — 0–100: junction density
-        exposure_score            — 0–100: composite exposure
+        pop_density_500m              — WorldPop along road buffer
+        near_school                   — bool: road within 500m of school (display only)
+        near_hospital                 — bool: road within 750m of hospital (display only)
+        dist_to_school_m              — distance to NEAREST school, metres
+        dist_to_hospital_m            — distance to NEAREST hospital, metres
+        dist_to_market_m              — distance to NEAREST market/bazaar, metres
+        dist_to_transit_m             — distance to NEAREST bus stop / station, metres
+        dist_to_nearest_vru_attractor_m — min distance across school/hospital/market/transit
+        school_proximity_score        — 0–100: continuous decay, feeds Exposure
+        hospital_proximity_score      — 0–100: continuous decay, feeds Exposure
+        market_proximity_score        — 0–100: continuous decay, feeds Exposure
+        transit_proximity_score       — 0–100: continuous decay, feeds Exposure
+        intersection_score            — 0–100: junction density
+        exposure_score                — 0–100: composite exposure
         priority_score            — SSS × (1 + 0.2 × exposure_norm): final priority
     """
     print("\n" + "=" * 60)
@@ -574,6 +604,60 @@ def enrich_segments(
     if dist_hosp.notna().any():
         print(f"  [Hospitals] Median distance to nearest hospital: {dist_hosp.median():.0f}m")
 
+    # 3b. Markets / bazaars
+    print("\n[3b/5] Markets (OSM)...")
+    market_gdf = _load_amenities(f"{data_dir}/markets", "Markets")
+    near_market = _buffer_spatial_join(gdf, market_gdf, MARKET_BUFFER_M, "Markets")
+    gdf["near_market"] = near_market
+    dist_market = _nearest_distance(gdf, market_gdf, "Markets")
+    gdf["dist_to_market_m"] = dist_market.round(0)
+    market_proximity = _proximity_decay_score(dist_market, MARKET_BUFFER_M)
+    gdf["market_proximity_score"] = (market_proximity * 100).round(1)
+    if dist_market.notna().any():
+        print(f"  [Markets] Median distance to nearest market: {dist_market.median():.0f}m")
+
+    # 3c. Transit hubs (bus stops, bus stations, train stations)
+    print("\n[3c/5] Transit hubs (OSM)...")
+    transit_gdf = _load_amenities(f"{data_dir}/transit", "Transit")
+    dist_transit = _nearest_distance(gdf, transit_gdf, "Transit")
+    gdf["dist_to_transit_m"] = dist_transit.round(0)
+    transit_proximity = _proximity_decay_score(dist_transit, TRANSIT_BUFFER_M)
+    gdf["transit_proximity_score"] = (transit_proximity * 100).round(1)
+    if dist_transit.notna().any():
+        print(f"  [Transit] Median distance to nearest stop/station: {dist_transit.median():.0f}m")
+
+    # 3d. Religious sites (temples, mosques, churches)
+    print("\n[3d/5] Religious sites (OSM)...")
+    religious_gdf = _load_amenities(f"{data_dir}/religious", "Religious")
+    dist_religious = _nearest_distance(gdf, religious_gdf, "Religious")
+    gdf["dist_to_religious_m"] = dist_religious.round(0)
+    religious_proximity = _proximity_decay_score(dist_religious, RELIGIOUS_BUFFER_M)
+    gdf["religious_proximity_score"] = (religious_proximity * 100).round(1)
+    if dist_religious.notna().any():
+        print(f"  [Religious] Median distance to nearest site: {dist_religious.median():.0f}m")
+
+    # 3e. Universities and colleges
+    print("\n[3e/5] Universities / colleges (OSM)...")
+    university_gdf = _load_amenities(f"{data_dir}/university", "University")
+    dist_university = _nearest_distance(gdf, university_gdf, "University")
+    gdf["dist_to_university_m"] = dist_university.round(0)
+    university_proximity = _proximity_decay_score(dist_university, UNIVERSITY_BUFFER_M)
+    gdf["university_proximity_score"] = (university_proximity * 100).round(1)
+    if dist_university.notna().any():
+        print(f"  [University] Median distance to nearest campus: {dist_university.median():.0f}m")
+
+    # 3f. Railway level crossings (high fatality risk in Maharashtra)
+    print("\n[3f/5] Railway level crossings (OSM)...")
+    crossings_gdf = _load_amenities(f"{data_dir}/crossings", "Crossings")
+    dist_crossings = _nearest_distance(gdf, crossings_gdf, "Crossings")
+    gdf["dist_to_crossing_m"] = dist_crossings.round(0)
+    crossings_proximity = _proximity_decay_score(dist_crossings, CROSSINGS_BUFFER_M)
+    gdf["crossings_proximity_score"] = (crossings_proximity * 100).round(1)
+    if dist_crossings.notna().any():
+        print(f"  [Crossings] Median distance to nearest level crossing: {dist_crossings.median():.0f}m")
+        near_n = (dist_crossings <= CROSSINGS_BUFFER_M).sum()
+        print(f"  [Crossings] Segments within {CROSSINGS_BUFFER_M}m of a level crossing: {near_n:,}")
+
     # 4. Intersections
     print("\n[4/5] Intersection density (OSM extract)...")
     intersections_gdf = _load_intersections(data_dir)
@@ -596,13 +680,33 @@ def enrich_segments(
     gdf["school_proximity_score"]   = (school_proximity * 100).round(1)
     gdf["hospital_proximity_score"] = (hospital_proximity * 100).round(1)
 
+    # Composite: minimum distance to ANY VRU-generating location
+    all_distances = pd.concat([
+        dist_school.rename("school"),
+        dist_hosp.rename("hospital"),
+        dist_market.rename("market"),
+        dist_transit.rename("transit"),
+        dist_religious.rename("religious"),
+        dist_university.rename("university"),
+        dist_crossings.rename("crossing"),
+    ], axis=1)
+    gdf["dist_to_nearest_vru_attractor_m"] = all_distances.min(axis=1).round(0)
+
     traffic_volume = gdf["weighted_sample"] if "weighted_sample" in gdf.columns else None
     if traffic_volume is None:
         print("  [Exposure] weighted_sample column not found — traffic volume "
               "excluded from Exposure Score (weight redistributed)")
     country_code = gdf["country_code"] if "country_code" in gdf.columns else None
-    exposure = compute_exposure_score(pop, int_score, school_proximity, hospital_proximity,
-                                       traffic_volume, country_code)
+    def _has_data(g): return g is not None and len(g) > 0
+    exposure = compute_exposure_score(
+        pop, int_score, school_proximity, hospital_proximity,
+        traffic_volume, country_code,
+        markets=market_proximity   if _has_data(market_gdf)     else None,
+        transit=transit_proximity  if _has_data(transit_gdf)    else None,
+        religious=religious_proximity if _has_data(religious_gdf) else None,
+        university=university_proximity if _has_data(university_gdf) else None,
+        crossings=crossings_proximity if _has_data(crossings_gdf) else None,
+    )
     gdf["exposure_score"] = exposure
 
     # Store each normalized component (0-100) for CALCULATION TRANSPARENCY

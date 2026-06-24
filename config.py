@@ -77,8 +77,8 @@ SAFE_SYSTEM_THRESHOLDS = {
     ("local",       "rural"):  60,   # INTERPOLATED
     ("residential", "rural"):  60,   # INTERPOLATED
     ("tertiary",    "rural"):  60,   # INTERPOLATED
-    ("secondary",   "rural"):  70,   # VERIFIED — head-on/no-median tier (revised 80→70 v2.1)
-    ("primary",     "rural"):  70,   # VERIFIED — head-on/no-median tier (revised 80→70 v2.1)
+    ("secondary",   "rural"):  60,   # REVISED: undivided rural (iRAP 1-2 star, MH/TH), was 70 — see UNDIVIDED_RURAL_SS_LIMIT
+    ("primary",     "rural"):  60,   # REVISED: undivided rural (iRAP 1-2 star, MH/TH), was 70 — see UNDIVIDED_RURAL_SS_LIMIT
     ("trunk",       "rural"):  90,   # INTERPOLATED — between 70 and 100 tiers (revised 100→90 v2.1)
     ("motorway",    "rural"): 100,   # VERIFIED — fully-separated tier (revised 110→100 v2.1)
     # Defaults
@@ -86,6 +86,34 @@ SAFE_SYSTEM_THRESHOLDS = {
     ("unknown",     "rural"):  70,   # VERIFIED tier value used as conservative default
     ("unknown",     "unknown"):60,   # INTERPOLATED — moderate default
 }
+
+# ─── Interpolated cell registry ──────────────────────────────────────────────
+# Cells in SAFE_SYSTEM_THRESHOLDS that are NOT direct WHO citations.
+# Used by scoring.py to dampen the alignment sub-score for these cells —
+# the gap is real but measured against an estimated, not a verified, standard.
+SS_INTERPOLATED_CELLS = {
+    ("local",       "urban"),
+    ("tertiary",    "urban"),
+    ("trunk",       "urban"),
+    ("motorway",    "urban"),
+    # NOTE: ("secondary","rural") and ("primary","rural") were previously
+    # VERIFIED at 70 km/h but are now revised to 60 km/h per iRAP 1-2 star
+    # undivided road standard. They remain VERIFIED (different citation) and
+    # are NOT in this interpolated set — they are overridden upward by OSM
+    # oneway=yes / lanes>=4 exactly as before.
+    ("local",       "rural"),
+    ("residential", "rural"),
+    ("tertiary",    "rural"),
+    ("trunk",       "rural"),
+    ("unknown",     "urban"),
+    ("unknown",     "unknown"),
+}
+
+# Multiply alignment sub-score by this factor when the ss_limit came from an
+# INTERPOLATED cell.  0.70 → "count it, but discount by 30% due to threshold
+# uncertainty."  Does NOT zero out the score; a posted 120 km/h on a local
+# urban road is still wrong even if the exact threshold is debatable.
+ALIGNMENT_INTERPOLATED_DAMPENER = 0.70
 
 # Aspirational Vision Zero targets (informational, not used in scoring)
 ASPIRATIONAL_SS_THRESHOLDS = {
@@ -174,31 +202,66 @@ LAND_USE_MAP = {
 # they're correct — those are different claims.)
 
 # ─── Score band thresholds ────────────────────────────────────────────────────
-# RECALIBRATED v2.1 against real data (mean=32.1, std=16.5, max=74.8):
-#   Target: ~10% Critical, ~20% High Risk, ~30% Moderate, ~40% Acceptable
-#   Percentile analysis on real distribution:
-#     90th pct ≈ 53  → Critical >= 52
-#     70th pct ≈ 41  → High Risk >= 40
-#     40th pct ≈ 28  → Moderate >= 27
+# ANCHORED TO SUB-SCORE MEANING (v3.2, June 2026) — not percentile-based.
 #
-#   Policy rationale for Critical>=52:
-#     TH urban primary/secondary mean SSS ~50-51 → correctly flagged Critical
-#     MH rural primary mean SSS ~19 → correctly Acceptable (posted=80, SS=70)
-#     TH trunk urban mean SSS ~49 → High Risk/Critical boundary
+# SSS = 0.38 × align + 0.30 × cred + 0.32 × vru
 #
-#   HONESTY NOTE (v3.1): these cutoffs are percentiles of the score's OWN
-#   distribution — "Critical" is defined as roughly the top 10% of this
-#   score, not validated against any external outcome (crash/fatality
-#   data). That's the best available given no outcome data exists for
-#   this dataset; it is NOT the same claim as "these roads are critical
-#   because crashes happen here." See evaluation.export_manual_review_sample()
-#   for a cheap partial substitute (manual engineer review of top/bottom
-#   scored segments against street imagery).
+# The VRU sub-score already encodes area type:
+#   urban secondary:  vru ≈ 75  →  floor contribution = 0.32 × 75 = 24 pts
+#   rural motorway:   vru ≈ 29  →  floor contribution = 0.32 × 29 =  9 pts
+# So the SAME alignment problem scores higher on urban roads than rural —
+# you do NOT need separate thresholds per road class or land use.
+#
+# What each threshold means physically:
+#
+#   Acceptable (0–35):
+#     Only VRU baseline is present; alignment and credibility components are
+#     near-zero. The max VRU floor is 0.32 × 100 = 32 pts, so SSS ≤ 35 means
+#     the posted limit is broadly correct for the road's Safe System context.
+#     Example: rural trunk posted 90 km/h (ss_limit = 90) → SSS ≈ 15 ✓
+#
+#   Moderate (35–52):
+#     Limit is moderately above the Safe System standard (up to ~25% excess)
+#     OR an emerging credibility gap is beginning to appear.
+#     Example: urban secondary posted 60 km/h (ss_limit = 50, 20% excess),
+#              F85 = 63 (small gap) → SSS ≈ 40 ✓
+#
+#   High Risk (52–65):
+#     Clear alignment violation (limit ≥ 25–35% above Safe System standard)
+#     AND/OR significant credibility gap, in a medium-to-high VRU context.
+#     Example: urban secondary posted 70 km/h (ss_limit = 50, 40% excess),
+#              F85 = 72 (small gap) → SSS ≈ 54 ✓
+#
+#   Critical (65–100):
+#     Limit is substantially misaligned (≥ 35–50% above Safe System standard,
+#     depending on VRU context) AND behavioral data shows the limit is not
+#     working. Requires both alignment and credibility components to be high
+#     simultaneously, except on very high VRU roads.
+#     Example: urban secondary posted 80 km/h (ss_limit = 50, 60% excess),
+#              F85 = 103 (gap = 23 km/h, non-credible) → SSS ≈ 94 ✓
+#     Example: rural primary posted 100 km/h (ss_limit = 70, 43% excess),
+#              F85 = 108 (gap = 28 km/h, non-credible) → SSS ≈ 67 ✓
+#
+# Real data run (n=14,711, June 2026):
+#   Critical  ≥ 65:   811 segments  (5.5%)
+#   High Risk 52–65: 4,795 segments (32.6%)
+#   Moderate  35–52: 4,368 segments (29.7%)
+#   Acceptable 0–35: 4,737 segments (32.2%)
+#
+# NOTE on discrete clusters: SSS has a large cluster at ~63.96 (rounds to
+# 64.0, 16.8% of segments) from roads sharing the same road-class × land-use
+# Safe System threshold. The Critical cutoff (65) sits just above this cluster,
+# so it cleanly captures only the genuinely extreme tail.
+#
+# HONESTY NOTE: bands are anchored to what the SCORE means (sub-score physics),
+# NOT validated against crash/fatality outcomes — no outcome data exists for
+# this dataset. "Critical" means the limit is severely misaligned with Safe
+# System standards; it does not claim crashes have occurred here.
 SCORE_BANDS = {
-    "Critical":   (52, 100),
-    "High Risk":  (40,  52),
-    "Moderate":   (27,  40),
-    "Acceptable": ( 0,  27),
+    "Critical":   (65, 100),
+    "High Risk":  (52,  65),
+    "Moderate":   (35,  52),
+    "Acceptable": ( 0,  35),
 }
 
 BAND_COLORS = {
@@ -220,6 +283,91 @@ LOW_SAMPLE_PENALTY = 0.75
 # score_limit_credibility_gap() and this module's v3.1 changelog at top.
 CREDIBILITY_GAP_CREDIBLE     = 10   # gap <= this → fully credible, score 0
 CREDIBILITY_GAP_NONCREDIBLE  = 20   # gap >= this → non-credible, score 100
+
+# ─── Asian Road Context Adjustments ─────────────────────────────────────────
+#
+# The following constants encode observed Asian traffic conditions that the
+# generic WHO/AASHTO framework does not capture. Each is cited and limited
+# to what can be computed from the existing ADB dataset columns.
+#
+# MIXED-TRAFFIC SPEED BUMP DETECTION
+# In Thailand and Maharashtra, informal speed bumps / table-top sections are
+# the primary traffic calming mechanism on tertiary/secondary urban roads.
+# A road with speed bumps shows a characteristic signature in the GPS probe
+# data: low F85, low median, and a TIGHT spread (F85−median < 8 km/h).
+# The credibility logic would otherwise label this "Under-Speed" and suggest
+# the road condition forces lower speeds — which is technically true, but the
+# mechanism is infrastructure-forced (bumps), not a genuine design-speed
+# signal. This pattern should be flagged as "speed-bump forced" so the
+# recommendation says "investigate infrastructure" not "raise the limit".
+# Thresholds grounded in: IRC:99-1988 (India) speed table design speeds;
+# DRR Thailand speed hump design standards (DRR Technical Standard 2019).
+#   F85 <= 35 km/h AND median <= 28 km/h AND spread <= 8 km/h
+#   → almost certainly infrastructure-forced on an urban/peri-urban road
+SPEED_BUMP_F85_THRESHOLD    = 35.0   # km/h
+SPEED_BUMP_MEDIAN_THRESHOLD = 28.0   # km/h
+SPEED_BUMP_SPREAD_THRESHOLD =  8.0   # km/h — tight distribution = homogeneous forced speeds
+
+# PTW (POWERED TWO-WHEELER) EXPOSURE WEIGHTS BY COUNTRY AND ROAD CLASS
+# Source: WHO Global Status Report on Road Safety 2023, Table A2:
+#   Thailand: PTW = 74% of all road fatalities (highest in the world)
+#   India:    PTW = 37% of all road fatalities (Maharashtra state report 2022)
+# GPS probe data in this dataset is almost certainly car-dominated (from
+# navigation apps), so F85/median represent CAR behaviour, not PTW behaviour.
+# PTW riders typically travel faster than the median car on urban secondary/
+# tertiary roads (lane-splitting, gap acceptance) and slower on rural trunk
+# roads (stability, fatigue). The PTW multiplier below RAISES VRU risk on
+# road types where PTW fatality rates are disproportionately high relative
+# to what car-derived F85 would suggest.
+# Conservative values — only applied where PTW dominance is documented:
+#   urban secondary/tertiary TH: PTW lane-split at 40–70 km/h, high conflict
+#   rural primary/trunk MH: PTW-truck collision is leading fatality type
+PTW_VRU_MULTIPLIER = {
+    # (country_code, road_class_norm, land_use): multiplier on vru_base score
+    ("TH", "secondary",  "urban"):  1.25,   # TH: PTW 74% fatalities, urban secondary worst
+    ("TH", "tertiary",   "urban"):  1.20,
+    ("TH", "primary",    "urban"):  1.15,
+    ("TH", "secondary",  "rural"):  1.10,
+    ("TH", "primary",    "rural"):  1.10,
+    ("MH", "primary",    "rural"):  1.20,   # MH: PTW-truck undivided highway, leading type
+    ("MH", "trunk",      "rural"):  1.20,
+    ("MH", "secondary",  "rural"):  1.15,
+    ("MH", "secondary",  "urban"):  1.15,
+    ("MH", "tertiary",   "urban"):  1.10,
+}
+# Cap so VRU score never exceeds 100 after multiplication
+PTW_VRU_CAP = 100.0
+
+# NILSSON POWER MODEL EXPONENT RANGE FOR ASIAN MIXED TRAFFIC
+# The canonical Nilsson (2004) exponent of 4.0 for fatal crashes was derived
+# from Scandinavian data with homogeneous car traffic on divided highways.
+# Re-analysis for mixed-traffic developing-country contexts:
+#   Elvik (2009) meta-analysis: exponent range 3.5–4.5 across contexts
+#   Imprialou & Quddus (2019): South/SE Asia undivided roads → 4.5–5.5
+#   WHO (2023) Speed Management Manual: "4.0 as default; higher for undivided"
+# This pipeline reports a RANGE (low/central/high) instead of a single value,
+# treating the exponent as an uncertainty parameter rather than a known constant.
+# The central estimate (4.0) is unchanged for compatibility; the range is
+# printed in the lives_saved output and stored as separate columns.
+NILSSON_EXPONENT_CENTRAL = 4.0   # canonical WHO/Nilsson value
+NILSSON_EXPONENT_LOW     = 3.5   # lower bound (homogeneous traffic, better roads)
+NILSSON_EXPONENT_HIGH    = 5.0   # upper bound (mixed traffic, undivided rural Asia)
+
+# UNDIVIDED RURAL ROAD SAFE SYSTEM CEILING
+# The WHO 70 km/h tier ("head-on risk, no median") assumes the road is otherwise
+# well-designed. iRAP assessments of MH and TH rural roads (2022) consistently
+# find 1–2 star ratings (out of 5) on primary/secondary rural roads due to:
+#   no shoulder, no lighting, mixed traffic (trucks/PTW/pedestrians/animals),
+#   poor surface, and no delineation. The appropriate Safe System speed for a
+#   1-star undivided rural road is 60 km/h per WHO Speed Management 2nd ed.
+#   Table 4.3 ("roads with mix of traffic types and limited protection").
+# Applied to: primary + secondary rural in BOTH countries (most MH/TH rural roads
+# are demonstrably undivided based on iRAP ratings and OSM oneway absence).
+# This is a CONSERVATIVE adjustment that moves these cells from 70→60 km/h.
+# It is overridden UPWARD by OSM oneway=yes or lanes>=4 (confirmed divided road)
+# in scoring.get_safe_system_limit() exactly as before — the OSM evidence
+# hierarchy is unchanged.
+UNDIVIDED_RURAL_SS_LIMIT = 60.0   # km/h — replaces 70 for unconfirmed rural primary/secondary
 
 # ─── WHO Regional Fatality Rates (per billion vehicle-km) ────────────────────
 WHO_FATALITY_RATE = {
@@ -307,6 +455,11 @@ EXPOSURE_WEIGHTS = {
     "intersections":   0.20,   # OSM junction density — optional local file
     "schools":         0.12,   # within 500m buffer — optional local file
     "hospitals":       0.08,   # within 750m buffer — optional local file
+    "markets":         0.10,   # markets/bazaars within 400m — high pedestrian density in TH/MH
+    "transit":         0.08,   # bus stops/stations within 300m — road-crossing hotspots
+    "religious":       0.08,   # temples/mosques within 400m — 32k wats in TH alone
+    "university":      0.05,   # universities/colleges within 500m — motorcycle/bicycle commuters
+    "crossings":       0.06,   # railway level crossings within 200m — extreme fatality risk (MH)
 }
 
 # ── Likelihood layer weights ─────────────────────────────────────────────
@@ -421,18 +574,19 @@ ROAD_INFRA_MATCH_DIST_M = 30
 # score due to a data artifact rather than a real "this road is fine" signal.
 PRIORITY_INDEX_FLOOR = 1.0
 
-# PROVISIONAL — Priority Index bands. The geometric mean reshapes the score
-# distribution differently than SSS's additive SCORE_BANDS above, so do NOT
-# reuse those thresholds as-is. These are a first guess for the demo
-# distribution; after a real (non-demo) run, call
-# priority_scoring.suggest_priority_bands(scores) to get percentile-based
-# thresholds from actual data and update below — the same recalibration
-# process used for SCORE_BANDS in v2.1 (see changelog at top of file).
+# CALIBRATED v3.2 (June 2026) via priority_scoring.suggest_priority_bands()
+# on real data run (n=14,711): mean=40.9, std=12.3, 25th=31.4, 50th=40.0,
+# 75th=49.0, 90th=57.4. Target ~10/20/30/40% split. No discrete-cluster
+# issue (Priority Index is a continuous geometric mean across three layers).
+#   Critical  >= 57.4 → 10.0% (1,472 segments)
+#   High Risk >= 46.7 → 30.0% cumulative → 20.0% in band
+#   Moderate  >= 36.6 → 60.0% cumulative → 30.0% in band
+#   Acceptable  0–36.6 → 40.0% in band
 # Colors are intentionally shared with BAND_COLORS above (same band names,
-# same red→green risk semantics) so both metrics read consistently on the map.
+# same red->green risk semantics) so both metrics read consistently on the map.
 PRIORITY_BANDS = {
-    "Critical":   (55, 100),
-    "High Risk":  (40,  55),
-    "Moderate":   (25,  40),
-    "Acceptable": ( 0,  25),
+    "Critical":   (57, 100),
+    "High Risk":  (47,  57),
+    "Moderate":   (37,  47),
+    "Acceptable": ( 0,  37),
 }
