@@ -1,0 +1,7 @@
+perturbed_weight,direction,new_value,spearman_rho_vs_base,pct_top20_changed
+speed_limit_alignment,+,0.273,0.9796,5.4
+speed_limit_alignment,-,0.111,0.9553,8.0
+limit_credibility_gap,+,0.5,0.9928,8.2
+limit_credibility_gap,-,0.389,0.9886,8.4
+vru_context_risk,+,0.409,0.9908,5.0
+vru_context_risk,-,0.278,0.9926,9.0

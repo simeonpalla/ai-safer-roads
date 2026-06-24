@@ -1,0 +1,15 @@
+layer,perturbed_weight,direction,new_value,spearman_rho_vs_base,pct_top20_changed
+likelihood,limit_credibility_gap,+,0.409,0.9997,5.8
+likelihood,limit_credibility_gap,-,0.278,0.9996,6.9
+likelihood,credibility,+,0.409,0.9977,3.8
+likelihood,credibility,-,0.278,0.9959,8.6
+likelihood,speed_variability,+,0.364,0.9957,12.1
+likelihood,speed_variability,-,0.222,0.9934,12.0
+severity,safe_system_gap,+,0.436,0.9978,7.0
+severity,safe_system_gap,-,0.311,0.9971,8.4
+severity,nilsson_risk,+,0.336,0.9987,7.2
+severity,nilsson_risk,-,0.189,0.9979,9.4
+severity,infrastructure_severity,+,0.318,0.9966,11.7
+severity,infrastructure_severity,-,0.167,0.9939,12.6
+severity,helmet_severity,+,0.182,0.996,12.8
+severity,helmet_severity,-,0.011,0.9952,12.8
