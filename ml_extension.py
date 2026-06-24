@@ -74,7 +74,7 @@ NUMERIC_FEATURES = PRIMARY_FEATURES + BEHAVIOURAL_FEATURES
 CAT_FEATURES = ["road_class_norm", "land_use", "ghsl_settlement_class"]
 
 XGB_PARAMS = dict(
-    n_estimators=400,
+    n_estimators=600,
     max_depth=6,
     learning_rate=0.04,
     subsample=0.8,

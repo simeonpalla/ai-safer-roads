@@ -84,119 +84,235 @@ def score_to_color(score: float) -> str:
 
 
 def _build_popup_html(row: pd.Series) -> str:
+    """
+    Four-layer popup per ADB Challenge brief:
+      Layer 1 (Executive):    Band + SSS score + speed comparison grid + confidence bar
+      Layer 2 (Explanation):  Plain-language reasons with evidence citations
+      Layer 3 (Intervention): Specific actions + impact + authority
+      Layer 4 (Technical):    Sub-scores, Nilsson range, data sources — collapsed
+    Design principles:
+      - Policymaker readable in <10 seconds (top card only)
+      - Every AI output shows what drove it (Layer 2 evidence bullets)
+      - No black-box: data sources shown in Layer 4
+      - Progressive disclosure: jargon hidden until requested
+    """
     sss           = row.get("sss", np.nan)
     band          = row.get("sss_band", "—")
     sl            = row.get("speed_limit", np.nan)
     ss            = row.get("ss_limit", np.nan)
     f85           = row.get("speed_85th", np.nan)
     med           = row.get("median_speed", np.nan)
-    pct_over      = row.get("pct_over_limit", np.nan)
     rc            = row.get("road_class_norm", row.get("road_class", "—"))
     lu            = row.get("land_use", "—")
     country       = row.get("country", row.get("country_code", "—"))
     cc            = row.get("country_code", "")
     seg_id        = row.get("segment_id", "—")
-    rec           = row.get("sss_recommendation", "")
     img_url       = row.get("image_url", "")
     credibility   = row.get("credibility_class", "")
     nilsson       = row.get("nilsson_fatal_ratio", np.nan)
+    nilsson_low   = row.get("nilsson_fatal_ratio_low", np.nan)
+    nilsson_high  = row.get("nilsson_fatal_ratio_high", np.nan)
+    priority_index= row.get("priority_index", np.nan)
+    priority_band = row.get("priority_band", "—")
     sinuosity     = row.get("sinuosity", np.nan)
-    priority_index = row.get("priority_index", np.nan)
-    priority_band  = row.get("priority_band", "—")
     spread        = (f85 - med) if pd.notna(f85) and pd.notna(med) else np.nan
+    align_score   = row.get("sub_score_limit_alignment", np.nan)
+    cred_score    = row.get("sub_score_limit_credibility", np.nan)
+    vru_score     = row.get("sub_score_vru_risk", np.nan)
+    rec_limit     = row.get("recommended_limit", np.nan)
 
-    band_color = BAND_COLORS.get(band, "#999")
+    BAND_BG = {
+        "Critical":    "#b91c1c", "High Risk": "#c2410c",
+        "Moderate":    "#a16207", "Acceptable": "#15803d",
+    }
+    BAND_LIGHT = {
+        "Critical":    "#fef2f2", "High Risk": "#fff7ed",
+        "Moderate":    "#fefce8", "Acceptable": "#f0fdf4",
+    }
+    BAND_BADGE = {
+        "Critical": "#ef4444", "High Risk": "#f97316",
+        "Moderate": "#eab308", "Acceptable": "#22c55e",
+    }
+
+    band_bg    = BAND_BG.get(band, "#374151")
+    band_badge = BAND_BADGE.get(band, "#9ca3af")
 
     def fmt(v, unit="", dec=1):
         return f"{v:.{dec}f}{unit}" if pd.notna(v) else "—"
 
-    # ── Q1: Is the posted limit right? ───────────────────────────────────────
+    # ── LAYER 1: Executive card ───────────────────────────────────────────────
+    sss_pct = min(100, max(0, sss)) if pd.notna(sss) else 0
+
+    # Limit verdict
     if pd.notna(sl) and pd.notna(ss):
         gap = sl - ss
         if sl > ss + 5:
-            q1_verdict   = "✗ TOO HIGH"
-            q1_color     = "#c0392b"
-            q1_detail    = f"Posted {sl:.0f} km/h — Safe System standard is {ss:.0f} km/h (+{gap:.0f} km/h over)"
+            verdict       = "Too high"
+            verdict_color = "#b91c1c"
+            limit_detail  = f"Posted {sl:.0f} km/h — Safe System standard is {ss:.0f} km/h (+{gap:.0f} km/h over)"
         elif sl < ss * 0.80:
-            q1_verdict   = "✗ TOO LOW (outdated / non-credible)"
-            q1_color     = "#e67e22"
-            q1_detail    = f"Posted {sl:.0f} km/h — Safe System standard is {ss:.0f} km/h (limit {abs(gap):.0f} km/h below road design speed)"
+            verdict       = "Too low — likely outdated"
+            verdict_color = "#c2410c"
+            limit_detail  = f"Posted {sl:.0f} km/h — Safe System standard is {ss:.0f} km/h (limit {ss-sl:.0f} km/h below design speed)"
         elif sl < ss - 5:
-            q1_verdict   = "⚠ SLIGHTLY LOW"
-            q1_color     = "#f39c12"
-            q1_detail    = f"Posted {sl:.0f} km/h vs Safe System {ss:.0f} km/h — may be overly restrictive"
+            verdict       = "Slightly low"
+            verdict_color = "#a16207"
+            limit_detail  = f"Posted {sl:.0f} km/h — slightly below Safe System standard ({ss:.0f} km/h)"
         else:
-            q1_verdict   = "✓ APPROPRIATE"
-            q1_color     = "#27ae60"
-            q1_detail    = f"Posted {sl:.0f} km/h aligns with Safe System standard ({ss:.0f} km/h)"
+            verdict       = "Broadly appropriate"
+            verdict_color = "#15803d"
+            limit_detail  = f"Posted {sl:.0f} km/h aligns with Safe System standard ({ss:.0f} km/h)"
     else:
-        q1_verdict = "— NO DATA"
-        q1_color   = "#7f8c8d"
-        q1_detail  = "No posted speed limit recorded for this segment"
+        verdict       = "No data"
+        verdict_color = "#6b7280"
+        limit_detail  = "No posted speed limit recorded for this segment"
 
-    # ── Q2: Why? ─────────────────────────────────────────────────────────────
-    reasons = []
-    if pd.notna(sl) and pd.notna(ss) and sl > ss + 5:
-        reasons.append(f"Limit {sl:.0f} km/h exceeds {ss:.0f} km/h Safe System ceiling for {lu} {rc} road")
-    if pd.notna(sl) and pd.notna(ss) and sl < ss * 0.80:
-        reasons.append(f"Limit {sl:.0f} km/h is {ss-sl:.0f} km/h below design speed — likely outdated or never revised after road upgrade")
-    if pd.notna(f85) and pd.notna(sl) and f85 > sl + 15:
-        if pd.notna(med) and med > sl:
-            reasons.append(f"Typical driver (median {med:.0f} km/h) AND fast tail (F85 {f85:.0f} km/h) both exceed posted limit — systemic non-compliance")
-        else:
-            reasons.append(f"F85 {f85:.0f} km/h exceeds limit by {f85-sl:.0f} km/h — fast-tail behaviour (median {fmt(med,' km/h')} within limit)")
-    if pd.notna(spread) and spread > 20:
-        reasons.append(f"Wide speed distribution (F85−median = {spread:.0f} km/h) — heavy mixed traffic, GPS data is car-biased")
-    if credibility == "Non-Credible":
-        reasons.append("Limit non-credible — F85 >20 km/h above posted, drivers ignore signage")
-    if credibility == "Infrastructure-Forced":
-        reasons.append("Low speeds likely from speed bumps/tables, not genuine compliance — investigate infrastructure")
-    if credibility == "Under-Speed":
-        reasons.append(f"F85 well below posted limit — road conditions, surface, or geometry forcing lower speeds")
-    if pd.notna(nilsson) and nilsson > 4:
-        reasons.append(f"Fatal crash risk {nilsson:.1f}× Safe System baseline (Nilsson Power Model)")
-    if pd.notna(sinuosity) and sinuosity >= 1.50:
-        reasons.append(f"Sharply curved alignment (SI={sinuosity:.2f}) — sight distance limits safe speed")
-    if cc == "TH" and rc in ("secondary", "tertiary", "primary"):
-        reasons.append("PTW high-risk corridor — Thailand PTW riders account for 74% of road fatalities (WHO 2023)")
-    if cc == "MH" and rc in ("primary", "trunk"):
-        reasons.append("PTW-truck conflict zone — Maharashtra PTW 37% of fatalities; undivided carriageway (iRAP 1-2 star)")
-    if not reasons:
-        reasons.append("Limit broadly appropriate; no major credibility or alignment issues detected")
+    # Speed comparison grid
+    speed_grid = ""
+    if pd.notna(sl) or pd.notna(ss) or pd.notna(med):
+        def _cell(label, val, highlight=False, warn=False):
+            bg    = "#eff6ff" if highlight else ("#fef2f2" if warn else "#f9fafb")
+            border= "#bfdbfe" if highlight else ("#fecaca" if warn else "#e5e7eb")
+            color = "#1d4ed8" if highlight else ("#b91c1c" if warn else "#111827")
+            v     = fmt(val, " km/h", 0) if pd.notna(val) else "—"
+            return (f'<td style="padding:0 4px;text-align:center">'
+                    f'<div style="background:{bg};border:1px solid {border};border-radius:6px;padding:5px 8px">'
+                    f'<div style="font-size:10px;color:#6b7280;margin-bottom:2px">{label}</div>'
+                    f'<div style="font-size:14px;font-weight:700;color:{color}">{v}</div>'
+                    f'</div></td>')
 
-    reasons_html = "".join(
-        f'<div style="margin:3px 0;padding:3px 6px;background:#f8f9fa;'
-        f'border-left:3px solid #c0392b;border-radius:2px;font-size:12px">'
-        f'• {r}</div>' for r in reasons
+        speed_grid = (
+            '<table style="width:100%;border-collapse:collapse;margin-top:8px">'
+            '<tr>'
+            + _cell("Posted limit", sl, highlight=True)
+            + _cell("Safe System", ss)
+            + _cell("Median (GPS)", med, warn=(pd.notna(med) and pd.notna(sl) and med > sl))
+            + _cell("F85 (GPS)", f85, warn=(pd.notna(f85) and pd.notna(sl) and f85 > sl + 10))
+            + '</tr></table>'
+        )
+        if pd.notna(spread):
+            spread_warn = ' style="color:#c2410c"' if spread > 20 else ""
+            speed_grid += (f'<div style="font-size:10px;color:#6b7280;margin-top:5px">'
+                           f'Speed spread (F85−median): <b{spread_warn}>{spread:.0f} km/h</b>'
+                           + (" — wide spread suggests mixed traffic; F85 may not represent typical driver" if spread > 20 else "")
+                           + '</div>')
+
+    # Confidence / SSS bar
+    confidence_bar = (
+        f'<div style="margin-top:8px">'
+        f'<div style="display:flex;justify-content:space-between;font-size:10px;color:rgba(255,255,255,0.7);margin-bottom:3px">'
+        f'<span>Risk Score</span><span style="font-weight:700">{sss_pct:.1f} / 100</span></div>'
+        f'<div style="height:5px;background:rgba(255,255,255,0.2);border-radius:3px;overflow:hidden">'
+        f'<div style="height:100%;width:{sss_pct}%;background:rgba(255,255,255,0.85);border-radius:3px"></div>'
+        f'</div></div>'
     )
 
-    # ── Q3: Intervention ─────────────────────────────────────────────────────
-    actions = []
-    if pd.notna(sl) and pd.notna(ss) and sl > ss + 5:
-        rec_limit = row.get("recommended_limit", ss)
-        reduction = sl - (rec_limit if pd.notna(rec_limit) else ss)
-        effort    = row.get("change_effort", "")
-        actions.append(("🚦", f"Reduce speed limit to {rec_limit:.0f} km/h (−{reduction:.0f} km/h) [{effort}]"))
-    if pd.notna(sl) and pd.notna(ss) and sl < ss * 0.80:
-        actions.append(("🚦", f"Review posted limit ({sl:.0f} km/h) — likely outdated vs Safe System standard ({ss:.0f} km/h). Commission road audit before raising limit."))
-    if credibility == "Non-Credible":
-        actions.append(("📋", "Redesign limit scheme — signage widely ignored. Physical calming or enforcement cameras required."))
-    if credibility == "Infrastructure-Forced":
-        actions.append(("🔍", "Verify speed bump/table presence on-site before recommending any limit change."))
-    if pd.notna(nilsson) and nilsson > 4 and rc in ("trunk", "primary"):
-        actions.append(("🛡️", "Install median barrier / physical separation — fatal crash risk >4× baseline on undivided highway"))
-    if pd.notna(sinuosity) and sinuosity >= 1.50:
-        actions.append(("⚠️", "Install curve warning chevrons and advance warning signs (SI ≥1.50)"))
-    elif pd.notna(sinuosity) and sinuosity >= 1.20:
-        actions.append(("⚠️", "Install curve advisory speed signs (SI ≥1.20)"))
-    if cc == "TH" and rc in ("secondary", "tertiary", "primary"):
-        actions.append(("🏍️", "Deploy PTW-targeted enforcement / awareness campaign"))
-    if cc == "MH" and rc in ("primary", "trunk"):
-        actions.append(("🏍️", "PTW-truck conflict: install rumble strips / hard shoulder demarcation"))
-    if not actions:
-        actions.append(("📊", "Monitor — schedule next audit in 12 months"))
+    # ── LAYER 2: Explanation bullets ─────────────────────────────────────────
+    reasons = []
 
-    # Responsible authority
+    def _reason(icon, text):
+        return (f'<div style="display:flex;align-items:flex-start;gap:8px;'
+                f'background:#fff;border:1px solid #e5e7eb;'
+                f'border-left:3px solid #ef4444;border-radius:0 6px 6px 0;'
+                f'padding:7px 10px;margin-bottom:5px">'
+                f'<span style="color:#ef4444;font-size:13px;flex-shrink:0">{icon}</span>'
+                f'<span style="font-size:12px;color:#374151;line-height:1.5">{text}</span>'
+                f'</div>')
+
+    if pd.notna(sl) and pd.notna(ss) and sl > ss + 5:
+        reasons.append(_reason("↑", f"Limit {sl:.0f} km/h exceeds {ss:.0f} km/h Safe System ceiling for {lu} {rc}"))
+    if pd.notna(sl) and pd.notna(ss) and sl < ss * 0.80:
+        reasons.append(_reason("⟳", f"Limit {sl:.0f} km/h is {ss-sl:.0f} km/h below road design speed — likely outdated or never revised after road upgrade"))
+    if pd.notna(f85) and pd.notna(sl) and pd.notna(med) and med > sl and f85 > sl + 15:
+        reasons.append(_reason("🚗", f"Typical driver (median {med:.0f} km/h) AND fast tail (F85 {f85:.0f} km/h) both exceed posted limit — systemic non-compliance, not an outlier"))
+    elif pd.notna(f85) and pd.notna(sl) and f85 > sl + 15:
+        reasons.append(_reason("🚗", f"F85 {f85:.0f} km/h significantly exceeds posted limit by {f85-sl:.0f} km/h"))
+    if credibility == "Non-Credible":
+        reasons.append(_reason("⚠", "Limit is non-credible — F85 >20 km/h above posted means drivers have effectively stopped following signage"))
+    if credibility == "Infrastructure-Forced":
+        reasons.append(_reason("🔍", "Low speeds likely caused by speed bumps or tables — verify infrastructure before recommending limit change"))
+    if pd.notna(spread) and spread > 20:
+        reasons.append(_reason("⇔", f"Wide speed distribution ({spread:.0f} km/h spread) — mixed traffic (trucks, PTW, cars); GPS probe data is car-biased"))
+    if pd.notna(nilsson) and nilsson > 4:
+        nl_str = f" (Asian range: {fmt(nilsson_low,'×',1)}–{fmt(nilsson_high,'×',1)})" if pd.notna(nilsson_low) else ""
+        reasons.append(_reason("❤", f"Fatal crash risk {nilsson:.1f}× Safe System baseline (Nilsson Power Model){nl_str}"))
+    if pd.notna(sinuosity) and sinuosity >= 1.50:
+        reasons.append(_reason("↩", f"Sharply curved alignment (sinuosity {sinuosity:.2f}) — sight distance limits safe speed"))
+    elif pd.notna(sinuosity) and sinuosity >= 1.20:
+        reasons.append(_reason("↩", f"Curved alignment (sinuosity {sinuosity:.2f}) — design speed adjustment applied"))
+    if cc == "TH" and rc in ("secondary", "tertiary", "primary"):
+        reasons.append(_reason("🏍", "PTW high-risk corridor — Thailand PTW riders account for 74% of road fatalities (WHO 2023)"))
+    if cc == "MH" and rc in ("primary", "trunk"):
+        reasons.append(_reason("🏍", "PTW–truck conflict zone — Maharashtra PTW 37% of fatalities; undivided carriageway (iRAP 1–2 star)"))
+    if not reasons:
+        reasons.append(_reason("✓", "Limit broadly appropriate; no major credibility or alignment issues detected"))
+
+    reasons_html = "".join(reasons)
+
+    # ── LAYER 3: Intervention actions ─────────────────────────────────────────
+    actions = []
+
+    def _action(icon, label, detail, impact, priority="Recommended"):
+        p_color = "#b91c1c" if priority == "Priority" else "#c2410c" if priority == "Urgent" else "#374151"
+        return (f'<div style="background:#eff6ff;border:1px solid #bfdbfe;'
+                f'border-left:3px solid #3b82f6;border-radius:0 6px 6px 0;'
+                f'padding:8px 12px;margin-bottom:6px">'
+                f'<div style="display:flex;align-items:flex-start;gap:8px">'
+                f'<span style="font-size:14px;color:#3b82f6;flex-shrink:0">{icon}</span>'
+                f'<div style="flex:1">'
+                f'<div style="font-size:12px;font-weight:700;color:#1e3a5f;margin-bottom:2px">{label}</div>'
+                f'<div style="font-size:11px;color:#4b5563;margin-bottom:3px">{detail}</div>'
+                f'<div style="font-size:10px;color:#059669">↑ {impact}</div>'
+                f'</div>'
+                f'<span style="font-size:10px;font-weight:700;color:{p_color};'
+                f'background:{p_color}12;border-radius:4px;padding:2px 6px;white-space:nowrap">{priority}</span>'
+                f'</div></div>')
+
+    if pd.notna(sl) and pd.notna(ss) and sl > ss + 5:
+        rl = rec_limit if pd.notna(rec_limit) else ss
+        reduction = sl - rl
+        effort = row.get("change_effort", "")
+        actions.append(_action("🚦", f"Reduce speed limit to {rl:.0f} km/h (−{reduction:.0f} km/h)",
+            f"Recommended limit based on Safe System standard for {lu} {rc} ({effort})",
+            "20–40% reduction in fatal crash probability (Nilsson Power Model)", "Priority"))
+    if pd.notna(sl) and pd.notna(ss) and sl < ss * 0.80:
+        actions.append(_action("📋", f"Commission road audit before raising limit",
+            f"Posted {sl:.0f} km/h appears outdated vs Safe System {ss:.0f} km/h. Audit confirms design speed.",
+            "Road audit prevents inappropriate limit increases on substandard infrastructure", "Priority"))
+    if credibility == "Non-Credible":
+        actions.append(_action("📷", "Install physical calming or speed enforcement cameras",
+            "Signage alone is not working — F85 >20 km/h above posted limit",
+            "Speed cameras reduce F85 by 5–15 km/h on treated corridors (WHO evidence)", "Urgent"))
+    if credibility == "Infrastructure-Forced":
+        actions.append(_action("🔍", "Verify speed bump / table presence on-site",
+            "Low F85 + low median + tight spread = probable infrastructure forcing",
+            "Prevents incorrect 'raise the limit' recommendation on bump-controlled roads", "Recommended"))
+    if pd.notna(nilsson) and nilsson > 4 and rc in ("trunk", "primary"):
+        actions.append(_action("🛡", "Install median barrier or physical separation",
+            f"Fatal crash risk {nilsson:.1f}× baseline on undivided carriageway",
+            "Median barriers reduce head-on fatalities by ~50% (iRAP evidence base)", "Priority"))
+    if pd.notna(sinuosity) and sinuosity >= 1.50:
+        actions.append(_action("⚠", "Install curve warning chevrons and advance warning signs",
+            f"Sinuosity {sinuosity:.2f} — sight distance limits safe speed on this alignment",
+            "Curve warning signs reduce curve crashes 15–25% (PIARC evidence)", "Recommended"))
+    elif pd.notna(sinuosity) and sinuosity >= 1.20:
+        actions.append(_action("⚠", "Install curve advisory speed signs",
+            f"Sinuosity {sinuosity:.2f} — moderate curvature detected",
+            "Advisory signs alert drivers to design speed limitation", "Recommended"))
+    if cc == "TH" and rc in ("secondary", "tertiary", "primary"):
+        actions.append(_action("🏍", "Deploy PTW-targeted enforcement and awareness campaign",
+            "Thailand PTW 74% of fatalities — this corridor type is documented high-risk",
+            "PTW-specific enforcement reduces PTW fatalities 20–35% (SWOV evidence)", "Recommended"))
+    if cc == "MH" and rc in ("primary", "trunk"):
+        actions.append(_action("🏍", "Install rumble strips and hard shoulder demarcation",
+            "Edge-line rumble strips alert PTW riders drifting toward opposing lane; "
+            "shoulder demarcation clarifies carriageway boundary on roads with no kerb",
+            "PTW lane departure interventions reduce PTW fatalities 20–35% (SWOV)", "Recommended"))
+    if not actions:
+        actions.append(_action("📊", "Monitor — schedule next audit in 12 months",
+            "No high-priority issues detected on this segment",
+            "Routine monitoring maintains data currency", "Routine"))
+
     authority_map_mh = {
         "motorway": "NHAI", "trunk": "NHAI / MSRDC",
         "primary": "Maharashtra PWD", "secondary": "Maharashtra PWD / District",
@@ -207,106 +323,235 @@ def _build_popup_html(row: pd.Series) -> str:
         "primary": "DOH — Dept. of Highways", "secondary": "DRR — Dept. of Rural Roads",
         "tertiary": "DRR / Local Administration",
     }
-    authority = (authority_map_mh if "Maharashtra" in country or cc == "MH" else authority_map_th).get(rc, "Road Authority")
+    authority = (authority_map_mh if cc == "MH" or "Maharashtra" in country else authority_map_th).get(rc, "Road Authority")
+    actions_html = "".join(actions)
 
-    actions_html = "".join(
-        f'<div style="margin:3px 0;padding:4px 6px;background:#eaf4fb;'
-        f'border-left:3px solid #2980b9;border-radius:2px;font-size:12px">'
-        f'{icon} {a}</div>' for icon, a in actions
+    tech_id  = f"tech_{str(seg_id).replace('/','_').replace(' ','_')}"
+    tab1_id  = f"t1_{tech_id}"
+    tab2_id  = f"t2_{tech_id}"
+    tab1b_id = f"tb1_{tech_id}"
+    tab2b_id = f"tb2_{tech_id}"
+
+    # Priority Index badge for metrics tab
+    pi_html = ""
+    if pd.notna(priority_index):
+        pi_colors = {
+            "Critical":   "#fee2e2:#991b1b",
+            "High Risk":  "#ffedd5:#9a3412",
+            "Moderate":   "#fef9c3:#713f12",
+            "Acceptable": "#dcfce7:#14532d",
+        }
+        pi_c = pi_colors.get(priority_band, "#f3f4f6:#374151").split(":")
+        pi_html = (f'<div style="margin-bottom:8px;padding:6px 10px;background:{pi_c[0]};'
+                   f'border-radius:5px;font-size:11px;font-weight:600;color:{pi_c[1]}">'
+                   f'Priority Index (Exposure × Likelihood × Severity): '
+                   f'{priority_index:.1f} — {priority_band}</div>')
+
+    nilsson_range = ""
+    if pd.notna(nilsson_low) and pd.notna(nilsson_high):
+        nilsson_range = f"<span style='color:#9ca3af'> [{nilsson_low:.1f}–{nilsson_high:.1f}×]</span>"
+
+    data_sources = (
+        "GPS mobility probe (ADB WeightedSample) · "
+        "Safe System: WHO Speed Management Manual 2nd ed. + iRAP 1-2 star · "
+        "Nilsson (2004) exponent 4.0 (Elvik 2009; Imprialou &amp; Quddus 2019) · "
+        "PTW weights: WHO Global Status Report 2023"
     )
 
     img_html = ""
     if img_url and isinstance(img_url, str) and img_url.startswith("http"):
-        img_html = f'<div style="margin-top:8px">📷 <a href="{img_url}" target="_blank" style="color:#2980b9">View street imagery</a></div>'
+        img_html = (f'<div style="padding-top:8px;border-top:1px solid #f3f4f6">'
+                    f'<a href="{img_url}" target="_blank" '
+                    f'style="font-size:11px;color:#3b82f6;text-decoration:none">'
+                    f'📷 View street imagery — verify road conditions</a></div>')
 
-    # Technical detail section (collapsed by default)
-    tech_id = f"tech_{seg_id}".replace("/", "_").replace(" ", "_")
-    align_score = row.get("sub_score_limit_alignment", np.nan)
-    cred_score  = row.get("sub_score_limit_credibility", np.nan)
-    vru_score   = row.get("sub_score_vru_risk", np.nan)
-    nilsson_low  = row.get("nilsson_fatal_ratio_low", np.nan)
-    nilsson_high = row.get("nilsson_fatal_ratio_high", np.nan)
-    pi_html = ""
-    if pd.notna(priority_index):
-        pi_color = BAND_COLORS.get(priority_band, "#999")
-        pi_html = f'<div style="margin-top:4px;padding:3px 6px;background:{pi_color}20;border-radius:3px;font-size:11px;color:#333">🎯 Priority Index: <b>{priority_index:.1f}</b> ({priority_band})</div>'
+    # Score bar helper for metrics tab
+    def _score_bar(score, weight_pct, color="#3b82f6"):
+        w = min(100, max(0, score)) if pd.notna(score) else 0
+        return (f'<div style="margin-bottom:8px">'
+                f'<div style="display:flex;justify-content:space-between;'
+                f'font-size:11px;color:#6b7280;margin-bottom:3px">'
+                f'<span>{weight_pct}</span>'
+                f'<span style="font-weight:700;color:#111827">{fmt(score)}/100</span></div>'
+                f'<div style="height:7px;background:#e5e7eb;border-radius:4px;overflow:hidden">'
+                f'<div style="height:100%;width:{w}%;background:{color};border-radius:4px"></div>'
+                f'</div></div>')
 
-    nilsson_range = ""
-    if pd.notna(nilsson_low) and pd.notna(nilsson_high):
-        nilsson_range = f" <span style='color:#777'>[{nilsson_low:.1f}–{nilsson_high:.1f} Asian range]</span>"
+    pct_over = row.get("pct_over_limit", np.nan)
+    change_effort = row.get("change_effort", "")
+    weighted_sample = row.get("weighted_sample", row.get("sample_size", np.nan))
+    est_lives = row.get("est_lives_saved", np.nan)
+    nilsson_high_val = row.get("nilsson_fatal_ratio_high", np.nan)
+    nilsson_low_val  = row.get("nilsson_fatal_ratio_low", np.nan)
 
-    tech_html = f"""
-    <div style="margin-top:8px">
-      <div onclick="var d=document.getElementById('{tech_id}');d.style.display=d.style.display=='none'?'block':'none'"
-           style="cursor:pointer;color:#2980b9;font-size:11px;user-select:none">
-        ▶ Technical detail (sub-scores, Nilsson, credibility)
-      </div>
-      <div id="{tech_id}" style="display:none;margin-top:6px;font-size:11px;color:#555;line-height:1.6">
-        <b>Segment:</b> {seg_id} &nbsp;|&nbsp; <b>Country:</b> {country}<br>
-        <b>Median speed:</b> {fmt(med,' km/h')} &nbsp;|&nbsp; <b>F85:</b> {fmt(f85,' km/h')}<br>
-        <b>% over limit:</b> {fmt(pct_over,'%')} (context only — not scored)<br>
-        <hr style="margin:4px 0;border-color:#eee">
-        <b>SSS sub-scores:</b><br>
-        &nbsp;Alignment (posted vs Safe System): {fmt(align_score)}/100<br>
-        &nbsp;Credibility gap (dual-signal F85+median): {fmt(cred_score)}/100<br>
-        &nbsp;VRU context risk (with PTW weighting): {fmt(vru_score)}/100<br>
-        <b>Nilsson fatal risk ratio:</b> {fmt(nilsson,'×')}{nilsson_range}<br>
-        <b>Credibility class:</b> {credibility if credibility else '—'}<br>
-        <b>Sinuosity index:</b> {fmt(sinuosity)}<br>
-        {pi_html}
-      </div>
-    </div>"""
-
-    # Speed facts line — shown in Q1 box so reader sees context immediately
-    spread_txt = f" · spread {spread:.0f} km/h" if pd.notna(spread) else ""
-    speed_facts = ""
-    if pd.notna(med) or pd.notna(f85):
-        speed_facts = (
-            f'<div style="margin-top:4px;font-size:11px;color:#555;'
-            f'background:#f0f0f0;padding:3px 6px;border-radius:3px">'
-            f'📊 Median {fmt(med," km/h")} · F85 {fmt(f85," km/h")}{spread_txt}'
-            f'</div>'
-        )
+    # Tab switching JS (unique per popup via IDs)
+    tab_js = (
+        f"function swTab_{tech_id}(t){{"
+        f"var a=document.getElementById('{tab1_id}');"
+        f"var b=document.getElementById('{tab2_id}');"
+        f"var ta=document.getElementById('{tab1b_id}');"
+        f"var tb=document.getElementById('{tab2b_id}');"
+        f"a.style.display=t==1?'block':'none';"
+        f"b.style.display=t==2?'block':'none';"
+        f"ta.style.background=t==1?'#1d4ed8':'transparent';"
+        f"ta.style.color=t==1?'#fff':'#6b7280';"
+        f"tb.style.background=t==2?'#1d4ed8':'transparent';"
+        f"tb.style.color=t==2?'#fff':'#6b7280';"
+        f"}}"
+    )
 
     return f"""
-    <div style="font-family:Arial,sans-serif;width:380px;font-size:13px;line-height:1.4">
-      <div style="background:{band_color};color:white;padding:8px 12px;
-                  border-radius:4px 4px 0 0;font-weight:bold;font-size:14px">
-        {band} &nbsp;·&nbsp; SSS {fmt(sss)}/100 &nbsp;·&nbsp; {lu} {rc}
+    <div style="font-family:system-ui,sans-serif;width:430px;background:#fff;
+                border:1px solid #e5e7eb;border-radius:10px;overflow:hidden">
+    <script>{tab_js}</script>
+
+      <!-- HEADER: always visible -->
+      <div style="background:{band_bg};color:#fff;padding:10px 16px">
+        <div style="font-size:11px;opacity:0.85;margin-bottom:2px">
+          {country} · {lu} {rc} · {seg_id}
+        </div>
+        <div style="display:flex;align-items:center;gap:10px">
+          <div style="font-size:16px;font-weight:700">{band} — SSS {fmt(sss)}/100</div>
+          <div style="margin-left:auto;font-size:11px;font-weight:700;
+                      background:rgba(255,255,255,0.18);border-radius:20px;padding:3px 11px">
+            {verdict}
+          </div>
+        </div>
+        {confidence_bar}
       </div>
-      <div style="padding:10px 12px;border:1px solid #ddd;border-top:none;border-radius:0 0 4px 4px">
 
-        <div style="margin-bottom:8px;padding:6px 8px;background:{q1_color}18;
-                    border:1px solid {q1_color}44;border-radius:4px">
-          <div style="font-weight:bold;color:{q1_color};font-size:13px">
-            ❶ IS THE LIMIT RIGHT? &nbsp; {q1_verdict}
+      <!-- Speed grid: always visible -->
+      <div style="padding:10px 14px 0;border-bottom:1px solid #e5e7eb">
+        <div style="font-size:10px;color:#9ca3af;margin-bottom:4px;letter-spacing:0.04em;text-transform:uppercase">Speed at a glance</div>
+        {speed_grid}
+        <div style="margin-top:6px;font-size:11px;color:#374151;
+                    background:#f9fafb;border-radius:5px;padding:5px 8px;margin-bottom:10px">
+          {limit_detail}
+        </div>
+      </div>
+
+      <!-- TAB BAR -->
+      <div style="display:flex;border-bottom:1px solid #e5e7eb;background:#f9fafb">
+        <button id="{tab1b_id}" onclick="swTab_{tech_id}(1)"
+                style="flex:1;padding:8px 12px;border:none;cursor:pointer;font-size:12px;
+                       font-weight:600;background:#1d4ed8;color:#fff;border-radius:0">
+          ❶ Why &amp; What to do
+        </button>
+        <button id="{tab2b_id}" onclick="swTab_{tech_id}(2)"
+                style="flex:1;padding:8px 12px;border:none;cursor:pointer;font-size:12px;
+                       font-weight:600;background:transparent;color:#6b7280;border-radius:0">
+          📊 Score metrics
+        </button>
+      </div>
+
+      <!-- TAB 1: WHY + INTERVENTION -->
+      <div id="{tab1_id}" style="display:block;padding:12px 14px">
+
+        <div style="font-size:10px;font-weight:700;color:#6b7280;letter-spacing:0.06em;
+                    text-transform:uppercase;margin-bottom:6px">Why this road is flagged</div>
+        {reasons_html}
+
+        <div style="display:flex;align-items:center;gap:8px;margin:10px 0 6px">
+          <div style="font-size:10px;font-weight:700;color:#6b7280;letter-spacing:0.06em;text-transform:uppercase">
+            Recommended interventions
           </div>
-          <div style="color:#333;margin-top:2px;font-size:12px">{q1_detail}</div>
-          {speed_facts}
-        </div>
-
-        <div style="margin-bottom:8px;padding:6px 8px;background:#fdf2f2;
-                    border:1px solid #e8c5c5;border-radius:4px">
-          <div style="font-weight:bold;color:#7f1d1d;font-size:13px">❷ WHY?</div>
-          <div style="margin-top:4px">{reasons_html}</div>
-        </div>
-
-        <div style="margin-bottom:6px;padding:6px 8px;background:#eaf4fb;
-                    border:1px solid #b3d9f2;border-radius:4px">
-          <div style="font-weight:bold;color:#1a4f72;font-size:13px">❸ INTERVENTION</div>
-          <div style="margin-top:4px">{actions_html}</div>
-          <div style="margin-top:6px;font-size:11px;color:#555">
-            <b>Responsible authority:</b> {authority}
+          <div style="margin-left:auto;font-size:10px;color:#6b7280;
+                      background:#f3f4f6;border-radius:4px;padding:2px 8px;white-space:nowrap">
+            {authority}
           </div>
         </div>
-
-        {tech_html}
+        {actions_html}
         {img_html}
       </div>
+
+      <!-- TAB 2: SCORE METRICS -->
+      <div id="{tab2_id}" style="display:none;padding:12px 14px">
+
+        {pi_html}
+
+        <!-- SSS Sub-scores with bars -->
+        <div style="font-size:10px;font-weight:700;color:#6b7280;letter-spacing:0.06em;
+                    text-transform:uppercase;margin-bottom:8px">SSS component scores</div>
+
+        <div style="margin-bottom:4px;font-size:11px;color:#374151;font-weight:600">
+          Alignment <span style="font-size:10px;font-weight:400;color:#9ca3af">(posted limit vs Safe System standard)</span>
+        </div>
+        {_score_bar(align_score, "Weight: 20%", "#3b82f6")}
+
+        <div style="margin-bottom:4px;font-size:11px;color:#374151;font-weight:600">
+          Credibility gap <span style="font-size:10px;font-weight:400;color:#9ca3af">(dual-signal F85 + median)</span>
+        </div>
+        {_score_bar(cred_score, "Weight: 45%", "#ef4444")}
+
+        <div style="margin-bottom:4px;font-size:11px;color:#374151;font-weight:600">
+          VRU context risk <span style="font-size:10px;font-weight:400;color:#9ca3af">(with PTW weighting)</span>
+        </div>
+        {_score_bar(vru_score, "Weight: 35%", "#f97316")}
+
+        <!-- SSS formula result -->
+        <div style="background:#f0fdf4;border:1px solid #86efac;border-radius:6px;
+                    padding:7px 10px;margin:8px 0;font-size:11px">
+          <b style="color:#15803d">SSS = 0.20×{fmt(align_score)} + 0.45×{fmt(cred_score)} + 0.35×{fmt(vru_score)} = <span style="font-size:13px">{fmt(sss)}</span></b>
+          <span style="color:#6b7280;margin-left:4px">→ {band}</span>
+        </div>
+
+        <hr style="border:none;border-top:1px solid #f3f4f6;margin:10px 0">
+
+        <!-- Behaviour evidence -->
+        <div style="font-size:10px;font-weight:700;color:#6b7280;letter-spacing:0.06em;
+                    text-transform:uppercase;margin-bottom:8px">GPS behaviour evidence</div>
+
+        <table style="width:100%;font-size:11px;border-collapse:collapse">
+          <tr style="border-bottom:1px solid #f3f4f6">
+            <td style="padding:4px 6px;color:#6b7280">Posted limit</td>
+            <td style="padding:4px 6px;font-weight:700;color:#1d4ed8;text-align:right">{fmt(sl,' km/h',0)}</td>
+          </tr>
+          <tr style="border-bottom:1px solid #f3f4f6">
+            <td style="padding:4px 6px;color:#6b7280">Safe System standard</td>
+            <td style="padding:4px 6px;font-weight:700;color:#374151;text-align:right">{fmt(ss,' km/h',0)}</td>
+          </tr>
+          <tr style="border-bottom:1px solid #f3f4f6">
+            <td style="padding:4px 6px;color:#6b7280">Median speed (GPS probe)</td>
+            <td style="padding:4px 6px;font-weight:700;color:{"#b91c1c" if pd.notna(med) and pd.notna(sl) and med > sl else "#374151"};text-align:right">{fmt(med,' km/h',0)}</td>
+          </tr>
+          <tr style="border-bottom:1px solid #f3f4f6">
+            <td style="padding:4px 6px;color:#6b7280">85th pct speed (F85)</td>
+            <td style="padding:4px 6px;font-weight:700;color:{"#b91c1c" if pd.notna(f85) and pd.notna(sl) and f85 > sl+10 else "#374151"};text-align:right">{fmt(f85,' km/h',0)}</td>
+          </tr>
+          <tr style="border-bottom:1px solid #f3f4f6">
+            <td style="padding:4px 6px;color:#6b7280">Speed spread (F85−median)</td>
+            <td style="padding:4px 6px;font-weight:700;color:{"#c2410c" if pd.notna(spread) and spread>20 else "#374151"};text-align:right">
+              {fmt(spread,' km/h',0)}{"  ⚠ mixed traffic" if pd.notna(spread) and spread > 20 else ""}</td>
+          </tr>
+          <tr style="border-bottom:1px solid #f3f4f6">
+            <td style="padding:4px 6px;color:#6b7280">% vehicles over limit</td>
+            <td style="padding:4px 6px;font-weight:700;color:#374151;text-align:right">{fmt(pct_over,'%',1)}</td>
+          </tr>
+          <tr style="border-bottom:1px solid #f3f4f6">
+            <td style="padding:4px 6px;color:#6b7280">Credibility class</td>
+            <td style="padding:4px 6px;font-weight:700;color:#374151;text-align:right">{credibility if credibility else "—"}</td>
+          </tr>
+          <tr style="border-bottom:1px solid #f3f4f6">
+            <td style="padding:4px 6px;color:#6b7280">Sinuosity index</td>
+            <td style="padding:4px 6px;font-weight:700;color:#374151;text-align:right">{fmt(sinuosity)} <span style="color:#9ca3af;font-weight:400">(1.0=straight)</span></td>
+          </tr>
+          <tr style="border-bottom:1px solid #f3f4f6">
+            <td style="padding:4px 6px;color:#6b7280">Nilsson fatal risk ratio</td>
+            <td style="padding:4px 6px;font-weight:700;color:{"#b91c1c" if pd.notna(nilsson) and nilsson>4 else "#374151"};text-align:right">
+              {fmt(nilsson,'×')}{nilsson_range}</td>
+          </tr>
+          {"<tr style='border-bottom:1px solid #f3f4f6'><td style='padding:4px 6px;color:#6b7280'>Est. lives saved/yr (illustrative)</td><td style='padding:4px 6px;font-weight:700;color:#059669;text-align:right'>" + fmt(est_lives) + "</td></tr>" if pd.notna(est_lives) else ""}
+          {"<tr><td style='padding:4px 6px;color:#6b7280'>Limit change effort</td><td style='padding:4px 6px;font-weight:700;color:#374151;text-align:right'>" + change_effort + "</td></tr>" if change_effort else ""}
+        </table>
+
+        <div style="margin-top:8px;padding:6px 8px;background:#f9fafb;
+                    border-radius:5px;font-size:9px;color:#9ca3af;line-height:1.6">
+          <b style="color:#6b7280">Sources:</b> {data_sources}
+        </div>
+      </div>
+
     </div>
     """
-
-
 
 def _priority_sample(df: pd.DataFrame, max_n: int, band_col: str = "sss_band",
                      random_state: int = 42) -> pd.DataFrame:
@@ -867,37 +1112,50 @@ def _geom_to_latlon_list(geom):
 
 def _build_legend_html() -> str:
     items = "".join(
-        f'<div style="display:flex;align-items:center;margin-bottom:4px">'
-        f'<div style="width:16px;height:16px;background:{color};border-radius:2px;margin-right:8px"></div>'
-        f'<span>{band}</span></div>'
+        f'<div style="display:flex;align-items:center;margin-bottom:5px">'
+        f'<div style="width:16px;height:5px;background:{color};border-radius:2px;margin-right:8px"></div>'
+        f'<span style="font-size:12px">{band}</span></div>'
         for band, color in BAND_COLORS.items()
     )
     return f"""
-    <div style="position:fixed;bottom:40px;left:12px;z-index:9999;
-                background:rgba(30,30,30,0.92);color:white;
-                padding:14px 18px;border-radius:8px;font-family:Arial,sans-serif;
-                font-size:13px;box-shadow:0 2px 12px rgba(0,0,0,0.4)">
-      <b style="font-size:14px">Speed Safety Score</b><br>
-      <hr style="border-color:#555;margin:6px 0">
-      {items}
-      <div style="margin-top:8px;display:flex;align-items:center">
-        <div style="width:12px;height:12px;background:#2563eb;border-radius:50%;margin-right:8px"></div>
-        <span style="font-size:12px">Schools (toggle layer — near roads only)</span>
+    <div id="legend-panel" style="position:fixed;bottom:40px;left:12px;z-index:9999;
+                background:rgba(22,22,30,0.95);color:white;
+                border-radius:9px;font-family:system-ui,sans-serif;
+                box-shadow:0 2px 16px rgba(0,0,0,0.45);min-width:200px">
+      <!-- Header - always visible, click to toggle -->
+      <div onclick="var b=document.getElementById('legend-body');
+                    var c=document.getElementById('legend-chev');
+                    if(b.style.display=='none'){{b.style.display='block';c.textContent='▲'}}
+                    else{{b.style.display='none';c.textContent='▼'}}"
+           style="display:flex;align-items:center;justify-content:space-between;
+                  padding:10px 14px;cursor:pointer;user-select:none">
+        <span style="font-size:13px;font-weight:700">Speed Safety Score</span>
+        <span id="legend-chev" style="font-size:10px;color:#9ca3af;margin-left:12px">▲</span>
       </div>
-      <div style="margin-top:4px;display:flex;align-items:center">
-        <div style="width:12px;height:12px;background:#dc2626;border-radius:50%;margin-right:8px"></div>
-        <span style="font-size:12px">Hospitals (toggle layer — near roads only)</span>
+      <!-- Body - expanded by default -->
+      <div id="legend-body" style="display:block;padding:0 14px 12px;border-top:1px solid rgba(255,255,255,0.1)">
+        <div style="padding-top:10px">
+          {items}
+        </div>
+        <div style="margin-top:8px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.1)">
+          <div style="display:flex;align-items:center;margin-bottom:5px">
+            <div style="width:12px;height:12px;background:#2563eb;border-radius:50%;margin-right:8px;flex-shrink:0"></div>
+            <span style="font-size:11px;color:#d1d5db">Schools (toggle layer)</span>
+          </div>
+          <div style="display:flex;align-items:center;margin-bottom:5px">
+            <div style="width:12px;height:12px;background:#dc2626;border-radius:50%;margin-right:8px;flex-shrink:0"></div>
+            <span style="font-size:11px;color:#d1d5db">Hospitals (toggle layer)</span>
+          </div>
+          <div style="display:flex;align-items:center">
+            <div style="width:16px;height:0;border-top:2px dashed #7c3aed;margin-right:8px;flex-shrink:0"></div>
+            <span style="font-size:11px;color:#d1d5db">Blindspot (high SSS, no imagery)</span>
+          </div>
+        </div>
+        <div style="margin-top:8px;font-size:10px;color:#6b7280;line-height:1.5">
+          Same scale: SSS view + Priority Index view<br>
+          AI for Safer Roads · ADB Challenge
+        </div>
       </div>
-      <div style="margin-top:8px;display:flex;align-items:center">
-        <div style="width:12px;height:3px;background:#7c3aed;margin-right:8px;
-                    border-top:2px dashed #7c3aed"></div>
-        <span style="font-size:12px">Blindspot (high SSS + no imagery)</span>
-      </div>
-      <div style="color:#aaa;font-size:11px;margin-top:8px">
-        Same color scale used for both SSS (default view) and Priority Index<br>
-        (toggle "🎯 Priority Index View" in layer control to compare)
-      </div>
-      <div style="color:#aaa;font-size:11px;margin-top:6px">AI for Safer Roads · ADB Challenge</div>
     </div>
     """
 
