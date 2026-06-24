@@ -37,13 +37,13 @@ Outputs land in `outputs/run_<timestamp>/`. The key file is `speed_safety_map.ht
 
 ### Level 1 — Speed Safety Score (SSS)
 
-Three sub-scores, equal-weighted:
+Three sub-scores, differentially weighted:
 
 | Sub-score | What it measures |
 |-----------|-----------------|
-| **Safe System Alignment** (38%) | Gap between posted limit and Safe System standard for road type + land use |
-| **Limit Credibility** (30%) | Whether the posted limit matches observed 85th-percentile speed |
-| **VRU Risk Context** (32%) | Pedestrian/cyclist exposure based on land use, road class, helmet compliance |
+| **Safe System Alignment** (25%) | Gap between posted limit and Safe System standard for road type + land use |
+| **Limit Credibility Gap** (40%) | Whether the posted limit is behaviorally credible given observed F85 speed — captures both overposting and underposting |
+| **VRU Risk Context** (35%) | Pedestrian/cyclist exposure based on land use, road class, GHSL urbanicity, helmet compliance |
 
 Safe System limits follow WHO / iRAP protocol. **Geometry adjustment**: sinuosity ≥1.20 triggers a −10 to −25 km/h downward adjustment per AASHTO Green Book, capped at 30 km/h floor. Applied to 5,803 segments (8.3% of scored network).
 
@@ -68,15 +68,14 @@ Components: WorldPop population density · HOTOSM schools and hospitals · OSM m
 ## Key findings (current run)
 
 - **14,711 segments** fully scored (Tier 2); **14,761** alignment-only (Tier 1)
-- **679 Critical** (4.6%) · **5,121 High Risk** (34.8%) · **3,790 Moderate** (25.8%) · **5,121 Acceptable** (34.8%)
+- **1,435 Critical** (9.8%) · **3,483 High Risk** (23.7%) · **3,953 Moderate** (26.9%) · **5,840 Acceptable** (39.7%)
 - **7,459 segments** need speed limit reduction; average reduction required: **21.8 km/h**
 - **8,010 segments** at >2× Nilsson baseline fatal-crash risk; **4,427** at >4×
-- **5,162 Hidden Danger segments** (SSS≥45, <40% over limit) — high-risk but compliant; missed by volume-based monitoring
 - Conventional monitoring misses **75%** of high-risk roads
 - **12,625 segments** covered by Mapillary; **2,710 high-risk blindspots** (no street-level imagery)
-- **5,800 priority segments** in policy brief (679 Critical + 5,121 High Risk)
+- **4,918 priority segments** in policy brief (1,435 Critical + 3,483 High Risk)
 - Est. **160.9 lives/year** saved if limits corrected (range 80–322) — illustrative, not validated
-- **309 intervention zones** covering 5,980 segments
+- **286 intervention zones** covering 4,362 segments (SSS≥50)
 - XGBoost R²=**0.877**, RMSE=**6.06** — up from 0.817/8.0 baseline
 - SHAP top driver: Safe System Speed Limit (mean |SHAP|=8.38)
 - Rank stability: mean Spearman ρ=0.99 under ±10% weight perturbations

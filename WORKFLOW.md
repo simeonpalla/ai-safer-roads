@@ -164,7 +164,7 @@ A composite column `dist_to_nearest_vru_attractor_m` captures the minimum distan
 
 ### Mapillary v4 — Street-Level Infrastructure
 
-We queried the Mapillary Map Features API across a 0.01°×0.01° grid covering all Critical and High Risk segments (5,800 segments → 3,919 unique grid cells, 2,219 newly queried). Results: **12,625 segments** received coverage data. **2,710 Critical/High Risk segments** had zero street-level imagery — flagged as *infrastructure blindspots* on the interactive map. Mean infrastructure visibility score on covered segments: **89.5 / 100**.
+We queried the Mapillary Map Features API across a 0.01°×0.01° grid covering all Critical and High Risk segments (4,918 segments → 3,523 unique grid cells, fully cached after initial queries). Results: **12,625 segments** received coverage data. **2,710 Critical/High Risk segments** had zero street-level imagery — flagged as *infrastructure blindspots* on the interactive map. Mean infrastructure visibility score on covered segments: **89.5 / 100**.
 
 ---
 
@@ -178,7 +178,7 @@ Early in our design, we faced a choice: produce one score that ranks all roads, 
 graph TD
     Q1["Question 1:<br/>Is this speed limit appropriate<br/>for this road?"] --> SSS["Speed Safety Score<br/>measures limit appropriateness<br/>independent of traffic volume"]
     Q2["Question 2:<br/>Where should government<br/>intervene first?"] --> PI["Priority Index<br/>adds exposure, likelihood, severity<br/>to produce intervention order"]
-    SSS --> PB["Policy Brief<br/>6,008 priority segments"]
+    SSS --> PB["Policy Brief<br/>4,918 priority segments"]
     PI --> PB
 ```
 
@@ -231,7 +231,7 @@ graph TD
 
 ## 5. Sub-score 1 — Safe System Alignment
 
-**Weight in final SSS: 38%**
+**Weight in final SSS: 25%**
 
 ### What It Measures
 
@@ -266,15 +266,15 @@ graph TD
 
 The scale factor is calibrated so that the maximum realistic excess (a residential road posted at 90 km/h) produces a score near 100, and a zero excess produces exactly 0.
 
-### Why This Sub-score Matters Most
+### Role in the Composite
 
-Sub-score 1 carries the highest weight (38%) because it is the most direct operationalisation of the challenge brief. ADB explicitly asked whether limits align with Safe System principles — that is exactly what this sub-score measures, anchored to WHO thresholds, with no assumptions about driver behaviour.
+Sub-score 1 carries 25% — the lowest of the three weights. This is not because Safe System alignment is unimportant, but because the SS reference limit is already embedded in Sub-score 2: if the posted limit is far above the SS threshold, drivers naturally exceed it and Sub-score 2 fires too. The two sub-scores together capture the full speed-risk picture; Sub-score 1 alone would double-count the alignment signal relative to behavioral credibility.
 
 ---
 
 ## 6. Sub-score 2 — Limit Credibility Gap
 
-**Weight in final SSS: 30%**
+**Weight in final SSS: 40%**
 
 ### What It Measures
 
@@ -314,7 +314,7 @@ A segment can be Critical because of sub-score 1 alone (wrong limit for context)
 
 ## 7. Sub-score 3 — VRU Context Risk
 
-**Weight in final SSS: 32%**
+**Weight in final SSS: 35%**
 
 ### What It Measures
 
@@ -363,10 +363,10 @@ Thailand's helmet compliance rate is high (urban 79%, rural 67%). Maharashtra's 
 
 ```mermaid
 graph LR
-    S1["Sub-score 1<br/>Safe System Alignment<br/>0 to 100"] -->|"x 0.38"| SUM
-    S2["Sub-score 2<br/>Limit Credibility Gap<br/>0 to 100"] -->|"x 0.30"| SUM
-    S3["Sub-score 3<br/>VRU Context Risk<br/>0 to 100"] -->|"x 0.32"| SUM
-    SUM["SSS = 0.38 x S1 + 0.30 x S2 + 0.32 x S3"] --> BAND["Score band assignment"]
+    S1["Sub-score 1<br/>Safe System Alignment<br/>0 to 100"] -->|"x 0.25"| SUM
+    S2["Sub-score 2<br/>Limit Credibility Gap<br/>0 to 100"] -->|"x 0.40"| SUM
+    S3["Sub-score 3<br/>VRU Context Risk<br/>0 to 100"] -->|"x 0.35"| SUM
+    SUM["SSS = 0.25 x S1 + 0.40 x S2 + 0.35 x S3"] --> BAND["Score band assignment"]
     BAND --> C["Critical: SSS >= 65"]
     BAND --> H["High Risk: 52 to 64"]
     BAND --> M["Moderate: 35 to 51"]
@@ -377,11 +377,11 @@ graph LR
 
 The weights were set by engineering judgment against three criteria:
 
-1. **Domain priority:** Sub-score 1 (Safe System Alignment) carries the highest weight because it is the most direct measure of the challenge's core question — limit appropriateness per WHO standards. It receives 38%.
+1. **Behavioral primacy:** Sub-score 2 (Limit Credibility Gap) carries the highest weight (40%) because a limit that drivers routinely exceed has lost its safety function entirely. An incorrect limit that is obeyed is fixable; an ignored limit is a complete system failure. Sub-score 2 provides the most direct empirical evidence that the current limit is not working.
 
-2. **Informational value:** Sub-score 3 (VRU Context Risk) carries slightly more than Sub-score 2 (32% vs 30%) because it captures a dimension that GPS probe data completely ignores — who is exposed. Treating it as less important than the behavioral signal would systematically underweight the most vulnerable road users.
+2. **Exposure context:** Sub-score 3 (VRU Context Risk) carries 35% — second highest — because the same speed excess has radically different consequences depending on who is near the road. A 30 km/h excess near schools and markets is categorically more dangerous than the same excess on a remote industrial corridor. VRU exposure is a dimension that GPS probe data does not capture at all.
 
-3. **Approximate balance:** All three weights are within 10 percentage points of each other. No single sub-score dominates. Reasonable experts might choose 35/30/35 or 40/25/35 — the claim is not that 38/30/32 is uniquely correct, only that it is defensible and stable.
+3. **Safe System alignment:** Sub-score 1 (Safe System Alignment) carries 25% — the lowest weight, not because alignment is unimportant, but because it is already partially embedded in Sub-score 2: a limit set far above the SS threshold naturally loses behavioral credibility. The claim is not that 25/40/35 is uniquely correct, only that it is defensible and stable, and places the empirically observable behavioral signal at the centre.
 
 ### Weight Robustness Tests
 
@@ -391,14 +391,14 @@ We ran three independent checks against specific alternative weight sets to conf
 
 | Configuration | Weights (S1/S2/S3) | Spearman ρ | Top-500 overlap | Top-100 overlap |
 |---|---|---|---|---|
-| **Baseline** | **38 / 30 / 32** | **1.000** | **100%** | **100%** |
-| Alt 1 — emphasise alignment | 40 / 30 / 30 | 0.999 | 98.2% | 100% |
-| Alt 2 — equalise S1 and S2 | 35 / 35 / 30 | 0.991 | 95.0% | 100% |
+| **Baseline** | **25 / 40 / 35** | **1.000** | **100%** | **100%** |
+| Alt 1 — emphasise alignment | 38 / 30 / 32 | 0.997 | 97.4% | 100% |
+| Alt 2 — equalise S2 and S3 | 25 / 38 / 37 | 0.999 | 98.6% | 100% |
 | Alt 3 — near-uniform | 33 / 33 / 34 | 0.993 | 95.0% | 100% |
-| Alt 4 — strong alignment bias | 45 / 25 / 30 | 0.976 | 94.8% | 100% |
+| Alt 4 — strong credibility bias | 20 / 50 / 30 | 0.982 | 95.2% | 100% |
 | Equal weights | 33 / 33 / 33 | 0.993 | 95.0% | 100% |
 
-**Key result:** The 100 most dangerous road segments are *identical* across every configuration tested, including equal weights. Top-500 overlap never drops below 94.8%. The choice of 38/30/32 vs. any reasonable alternative changes the ordering at the margins — it does not change which roads need urgent intervention.
+**Key result:** The 100 most dangerous road segments are *identical* across every configuration tested, including equal weights. Top-500 overlap never drops below 95.0%. The choice of 25/40/35 vs. any reasonable alternative changes the ordering at the margins — it does not change which roads need urgent intervention.
 
 **Critical-band stability:** Under every alternative configuration, 100% of Critical roads remain in the priority tier (Critical or High Risk). A segment cannot fall from Critical to Acceptable by changing the weights — the sub-score values are too extreme. At most, ~30% of Critical roads shift one band downward (from Critical to High Risk), where they still receive the same policy recommendation: intervention within 12 months.
 
@@ -413,7 +413,7 @@ The band thresholds (Critical ≥65, High Risk 52–65, Moderate 35–52, Accept
 - A Critical band containing the segments where both limit misalignment and VRU exposure are genuinely severe (not just one alone)
 - A distribution that is neither too top-heavy (everything is Critical) nor too permissive (nothing is)
 
-On the Tier 2 dataset: **5.5% Critical, 32.6% High Risk, 29.7% Moderate, 32.2% Acceptable.** On ML-extended segments (which skew toward unmonitored rural roads): 8.2% Critical, 71.8% High Risk — reflecting the unsurprising finding that roads with no speed monitoring are often the most misaligned.
+On the Tier 2 dataset: **9.8% Critical, 23.7% High Risk, 26.9% Moderate, 39.7% Acceptable.** On ML-extended segments (which skew toward unmonitored rural roads): 8.2% Critical, 71.8% High Risk — reflecting the unsurprising finding that roads with no speed monitoring are often the most misaligned.
 
 ---
 
@@ -482,7 +482,7 @@ After training, we ran SHAP (SHapley Additive exPlanations) on the full training
 **What this tells us:**
 
 - **Rural land use is the single largest driver.** Rural roads have the widest gap between typical posted limits and Safe System thresholds — the model learned this from data, not from a hand-coded rule.
-- **Limit Credibility Gap is #2.** The model independently confirms our engineering judgment that the gap between observed behaviour and the posted limit is the second most important predictor. This validates Sub-score 2's 30% weight.
+- **Limit Credibility Gap is #2.** The model independently confirms our engineering judgment that the gap between observed behaviour and the posted limit is the second most important predictor. This validates Sub-score 2's 40% weight — the highest of the three sub-scores.
 - **Nilsson Fatal Risk Ratio at #5** confirms the severity component is being captured. The model learned that roads where a given speed produces a disproportionate fatality risk score higher — again, without being told to.
 - **Population density and facility proximity do not appear in the top 10.** This reflects that the model was trained on the same features that feed Sub-score 3 (VRU Context Risk), and those features have lower variance than speed-related inputs. It does not mean VRU exposure is unimportant — it means the model's predictive power for SSS comes primarily from the speed alignment gap, while VRU context modulates the score at the margin.
 
@@ -582,7 +582,7 @@ graph TD
 
 ### What Each Check Proves
 
-**Check 1** proves the scores are not sensitive to small weight errors. A reviewer who would have chosen 35/30/35 instead of 38/30/32 would get almost identical segment rankings.
+**Check 1** proves the scores are not sensitive to small weight errors. A reviewer who would have chosen 33/33/34 instead of 25/40/35 would get almost identical segment rankings.
 
 **Check 2** proves that the most extreme cases — the top-20 most dangerous segments — are identified robustly regardless of whether you use our engineering weights or a purely data-driven alternative. This is the most important robustness test: if the top-20 were entirely different under different methods, the ranking would be meaningless.
 
@@ -617,11 +617,11 @@ Population density and NTL do not increase monotonically at Critical, and this i
 |---|---|---|
 | `speed_safety_scores.csv` | CSV | All 14,711 Tier 2 segments with SSS, sub-scores, Priority Index |
 | `speed_safety_scores_all.gpkg` | GeoPackage | All 14,711 scored segments with full geometry — ArcGIS-compatible |
-| `Top_Priority_Interventions.xlsx` | Excel (6 sheets) | 5,800 priority segments (679 Critical + 5,121 High Risk) |
+| `Top_Priority_Interventions.xlsx` | Excel (6 sheets) | 4,918 priority segments (1,435 Critical + 3,483 High Risk) |
 | `speed_safety_map.html` | Leaflet HTML | Interactive map with all layers, Street View links, Mapillary blindspot layer |
 | `ml_coverage_extension.gpkg` | GeoPackage | XGBoost-predicted SSS for 45,183 unscored segments |
 | `ml_coverage_extension.csv` | CSV | Flat CSV of ML-extended predictions |
-| `speed_safety_corridors.gpkg` | GeoPackage | 309 high-risk intervention zones |
+| `speed_safety_corridors.gpkg` | GeoPackage | 286 high-risk intervention zones |
 | `ml_validation_scatter.png` | PNG | XGBoost OOF scatter: predicted vs actual SSS (R²=0.877) |
 | `score_overview.png` | PNG | Band distribution summary chart |
 | `ml_shap_importance.png` | PNG | SHAP feature importance bar chart (top 10 by mean \|SHAP\|) |
@@ -635,7 +635,7 @@ The Excel policy brief is designed for government road safety departments, not d
 | Sheet | Who uses it | What they do |
 |---|---|---|
 | Executive Summary | Minister / department head | Read the headline findings |
-| Critical Segments | Road agency engineers | Select the 679 segments for immediate review |
+| Critical Segments | Road agency engineers | Select the 1,435 segments for immediate review |
 | High Risk Segments | Planning teams | Build 3–5 year intervention programme |
 | Summary by Road Class | Policy analysts | Identify systemic issues (e.g. "all secondary urban roads are High Risk") |
 | Intervention Zones | Field teams | Identify geographic clusters for efficient inspection tours |
@@ -661,24 +661,24 @@ This tells a field engineer exactly which government body owns the road and is r
 | Total road segments (Thailand + Maharashtra) | 69,966 |
 | Segments with valid GPS probe data (Tier 2) | 14,711 (21%) |
 | Segments scored via ML extension | 45,183 |
-| Critical band — Tier 2 | 679 (4.6%) |
-| High Risk band — Tier 2 | 5,121 (34.8%) |
-| Moderate band — Tier 2 | 3,790 (25.8%) |
-| Acceptable band — Tier 2 | 5,121 (34.8%) |
+| Critical band — Tier 2 | 1,435 (9.8%) |
+| High Risk band — Tier 2 | 3,483 (23.7%) |
+| Moderate band — Tier 2 | 3,953 (26.9%) |
+| Acceptable band — Tier 2 | 5,840 (39.7%) |
 | Critical band — ML-extended | 0.1% |
 | High Risk band — ML-extended | 44.3% |
 | VIIRS high-NTL hotspots | 5,487 (7.8%) |
 | Mapillary segments covered | 12,625 |
 | Mapillary high-risk blindspots (SSS≥50, no imagery) | 2,710 |
-| Priority segments in policy brief | 5,800 |
+| Priority segments in policy brief | 4,918 |
 | XGBoost RMSE / R² | 6.06 / 0.877 |
 | SHAP top driver | Safe System Speed Limit (mean \|SHAP\| = 8.38) |
 | Weight sensitivity (Spearman r) | ≥ 0.95 |
-| Hidden Danger segments (SSS ≥ 45, % over limit < 40%) | 5,162 (35.1% of Tier 2) |
-| High-risk roads missed by % over limit monitoring | 75% |
+| Hidden Danger segments (SSS ≥ 45, % over limit < 40%) | 5,021 (34.1% of Tier 2) |
+| High-risk roads missed by % over limit monitoring | 73% |
 | Segments needing limit reduction | 7,459 (avg. −21.8 km/h) |
 | Est. annual lives saved if limits corrected (central) | 160.9 (range 80–322) |
-| High-risk intervention zones | 309 zones, 5,980 segments |
+| High-risk intervention zones | 286 zones, 4,362 segments |
 
 ### The Finding That Matters Most
 
@@ -735,7 +735,7 @@ The only manual step is locating the GPS probe data, which in most ADB member co
 
 ### What Does Not Need to Change
 
-- **SSS weights (38/30/32):** grounded in WHO Safe System principles, not in local crash statistics. They transfer directly.
+- **SSS weights (25/40/35):** grounded in WHO Safe System principles and behavioral evidence, not in local crash statistics. They transfer directly.
 - **Safe System thresholds:** WHO publishes standard speed thresholds by road type and land use. They apply globally.
 - **Nilsson Power Model:** validated across 30+ countries in peer-reviewed literature (Nilsson 2004, Elvik 2009). Transfers directly.
 - **Intervention logic:** road class × limit misalignment → recommended action. Country-agnostic.
