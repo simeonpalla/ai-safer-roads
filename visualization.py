@@ -451,24 +451,17 @@ def build_interactive_map(
 
     m = folium.Map(location=[center_lat, center_lon], zoom_start=5, tiles=None)
 
-    # MAP LANGUAGE FIX: standard "OpenStreetMap" tiles render place labels
-    # in the LOCAL script (confirmed from screenshots — Chinese/Thai/
-    # Devanagari over China/Thailand/India). Wikimedia's osm-intl endpoint
-    # is the same OSM data with English labels forced via lang=en, free,
-    # no API key. This is now the only/default base layer so "the whole
-    # map in English" is guaranteed rather than one option among several
-    # whose language behaviour isn't certain.
+    # Light basemap: CartoDB Positron — clean, minimal, English labels,
+    # free CDN, no API key, highly reliable. Default layer shown on load.
     folium.TileLayer(
-        tiles="https://{s}.maps.wikimedia.org/osm-intl/{z}/{x}/{y}.png?lang=en",
-        attr="© OpenStreetMap contributors, © Wikimedia",
-        subdomains=["a", "b", "c"],
-        name="Light (English)",
+        tiles="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
+        attr='© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors © <a href="https://carto.com/attributions">CARTO</a>',
+        subdomains=["a", "b", "c", "d"],
+        name="Light",
         max_zoom=19,
     ).add_to(m)
-    # Dark theme kept as a secondary option. CartoDB's dark_matter style
-    # isn't guaranteed English the same explicit way as the layer above —
-    # if you need certainty on a non-default layer too, drop it and use
-    # only the English layer above.
+
+    # Dark theme as secondary option (toggle in layer control)
     folium.TileLayer("CartoDB dark_matter", name="Dark").add_to(m)
 
     Fullscreen().add_to(m)
