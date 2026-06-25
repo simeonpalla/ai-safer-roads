@@ -7,26 +7,5 @@ __pycache__/
 env/
 data/
 
-outputs/
-*.gpkg
-*.tif
-*.png
-*.xlsx
-*.csv
-
-outputs/
-
-*.gpkg
-*.tif
-
-enrichment_data/road_infra/
-enrichment_data/crossings/
-enrichment_data/hospitals/
-enrichment_data/markets/
-enrichment_data/religious/
-enrichment_data/schools/
-enrichment_data/transit/
-enrichment_data/university/
-
 __pycache__/
 .env
