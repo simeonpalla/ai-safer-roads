@@ -287,6 +287,31 @@ def _build_popup_html(row: pd.Series) -> str:
     img_html   = (f'<div class="pp-img-link"><a href="{img_url}" target="_blank">📷 View street imagery</a></div>'
                   if img_url and isinstance(img_url, str) and img_url.startswith("http") else "")
 
+    # ❶ IS THE LIMIT RIGHT — always visible block above tabs
+    if pd.notna(sl) and pd.notna(ss):
+        if sl > ss + 5:
+            q1_cls, q1_hdr_cls = "pp-q1-high", "pp-q1-hdr-high"
+            q1_verdict_label = "✗ TOO HIGH"
+        elif sl < ss * 0.80:
+            q1_cls, q1_hdr_cls = "pp-q1-lo", "pp-q1-hdr-lo"
+            q1_verdict_label = "✗ TOO LOW (outdated)"
+        elif sl < ss - 5:
+            q1_cls, q1_hdr_cls = "pp-q1-hi", "pp-q1-hdr-hi"
+            q1_verdict_label = "⚠ SLIGHTLY LOW"
+        else:
+            q1_cls, q1_hdr_cls = "pp-q1-ok", "pp-q1-hdr-ok"
+            q1_verdict_label = "✓ APPROPRIATE"
+    else:
+        q1_cls, q1_hdr_cls, q1_verdict_label = "pp-q1-ok", "pp-q1-hdr-ok", "— NO DATA"
+
+    q1_speed_row = ""
+    if pd.notna(med) or pd.notna(f85):
+        parts = []
+        if pd.notna(med): parts.append(f"Median {med:.0f} km/h")
+        if pd.notna(f85): parts.append(f"F85 {f85:.0f} km/h")
+        if pd.notna(spread): parts.append(f"spread {spread:.0f} km/h")
+        q1_speed_row = f'<div class="pp-q1-speed">📊 {" · ".join(parts)}</div>'
+
     # "Critical + Appropriate" fix: verdict = limit direction, band = overall SSS.
     # These measure different things. A Critical road can have an Appropriate limit
     # if drivers ignore it (high credibility gap). Make this explicit.
@@ -308,19 +333,30 @@ def _build_popup_html(row: pd.Series) -> str:
 </div>
 <div class="pp-body">
 {grid}
+<div style="padding:10px 14px 0">
+  <div class="pp-q1 {q1_cls}">
+    <div class="pp-q1-hdr {q1_hdr_cls}">❶ IS THE LIMIT RIGHT? &nbsp; {q1_verdict_label}</div>
+    <div class="pp-q1-detail">{vlabel}</div>
+    {q1_speed_row}
+  </div>
+</div>
 <div class="pp-tabs">
-  <button class="pp-tab active" onclick="swTab('{uid}',0)">Why &amp; What to do</button>
-  <button class="pp-tab" onclick="swTab('{uid}',1)">Score metrics</button>
+  <button class="pp-tab active" onclick="swTab('{uid}',0)">❶❷❸ Assessment</button>
+  <button class="pp-tab" onclick="swTab('{uid}',1)">📊 Score metrics</button>
 </div>
 <div id="{uid}">
   <div class="pp-panel active">
-    <div class="pp-section-hdr">Why this road is flagged</div>
-    {''.join(reasons)}
-    <div class="pp-actions-hdr">
-      <div class="pp-section-hdr" style="margin:0">Interventions</div>
-      <div class="pp-auth">{authority}</div>
+    <div class="pp-q-block pp-q-why">
+      <div class="pp-q-hdr pp-q-hdr-why">❷ WHY?</div>
+      <div class="pp-q-body">{''.join(reasons)}</div>
     </div>
-    {''.join(actions)}
+    <div class="pp-q-block pp-q-int">
+      <div class="pp-q-hdr pp-q-hdr-int">❸ INTERVENTION</div>
+      <div class="pp-q-body">
+        <div class="pp-auth-row">Responsible authority: {authority}</div>
+        {''.join(actions)}
+      </div>
+    </div>
     {img_html}
   </div>
   <div class="pp-panel">
@@ -510,6 +546,21 @@ def build_interactive_map(
     .pp-data-tbl td:last-child{padding:4px 6px;font-weight:700;text-align:right}
     .pp-sources{margin-top:8px;padding:6px 8px;background:#f9fafb;border-radius:5px;font-size:9px;color:#9ca3af;line-height:1.6}
     .pp-sources b{color:#6b7280}
+    .pp-q1{margin:0 0 8px;padding:8px 10px;border-radius:6px}
+    .pp-q1-ok{background:#f0fdf4;border:1px solid #86efac}
+    .pp-q1-hi{background:#fff7ed;border:1px solid #fdba74}
+    .pp-q1-lo{background:#fff7ed;border:1px solid #fdba74}
+    .pp-q1-high{background:#fef2f2;border:1px solid #fca5a5}
+    .pp-q1-hdr{font-weight:700;font-size:12px;margin-bottom:4px}
+    .pp-q1-hdr-ok{color:#15803d}.pp-q1-hdr-hi{color:#c2410c}.pp-q1-hdr-lo{color:#c2410c}.pp-q1-hdr-high{color:#b91c1c}
+    .pp-q1-detail{font-size:11px;color:#374151;margin-bottom:4px}
+    .pp-q1-speed{font-size:11px;color:#6b7280;background:#f9fafb;padding:3px 6px;border-radius:3px}
+    .pp-q-block{margin:6px 0 0}
+    .pp-q-block.pp-q-why{background:#fdf2f2;border:1px solid #e8c5c5;border-radius:6px;padding:8px 10px}
+    .pp-q-block.pp-q-int{background:#eaf4fb;border:1px solid #b3d9f2;border-radius:6px;padding:8px 10px}
+    .pp-q-hdr{font-weight:700;font-size:12px;margin-bottom:6px}
+    .pp-q-hdr-why{color:#7f1d1d}.pp-q-hdr-int{color:#1a4f72}
+    .pp-auth-row{font-size:11px;color:#555;font-weight:700;margin-bottom:6px}
     </style>
     <script>
     function swTab(id,t){
