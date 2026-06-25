@@ -125,20 +125,48 @@ def _build_popup_html(row: pd.Series) -> str:
 
     uid = str(seg_id).replace("/","_").replace(" ","_")
 
-    if pd.notna(sl) and pd.notna(ss):
-        gap = sl - ss
-        if sl > ss + 5:
-            verdict = "Too high"
-            vlabel  = f"Posted {sl:.0f} km/h — SS standard {ss:.0f} km/h (+{gap:.0f} over)"
-        elif sl < ss * 0.80:
-            verdict = "Too low — outdated"
-            vlabel  = f"Posted {sl:.0f} km/h — SS standard {ss:.0f} km/h ({ss-sl:.0f} below design speed)"
-        elif sl < ss - 5:
-            verdict = "Slightly low"
-            vlabel  = f"Posted {sl:.0f} km/h — slightly below SS standard ({ss:.0f} km/h)"
+    # Verdict uses both F85 and median — mirrors how credibility sub-score is computed:
+    # raw_gap = F85 − posted; reliability dampened by spread; confirmed by median gap.
+    if pd.notna(f85) and pd.notna(sl):
+        gap_f85  = f85 - sl
+        med_over = (med - sl) if pd.notna(med) else None
+        both_exceed = med_over is not None and med_over > 0
+
+        if gap_f85 >= 20:
+            verdict = "Limit non-credible"
+            if both_exceed:
+                vlabel = (f"F85 {f85:.0f} (+{gap_f85:.0f}) · median {med:.0f} (+{med_over:.0f}) km/h "
+                          f"— both exceed posted {sl:.0f} km/h")
+            else:
+                m_str = f" · median {med:.0f} km/h" if pd.notna(med) else ""
+                vlabel = f"F85 {f85:.0f} km/h (+{gap_f85:.0f} above posted {sl:.0f} km/h){m_str}"
+        elif gap_f85 >= 10:
+            verdict = "Low credibility"
+            if both_exceed:
+                vlabel = (f"F85 {f85:.0f} (+{gap_f85:.0f}) · median {med:.0f} (+{med_over:.0f}) km/h "
+                          f"above posted {sl:.0f} km/h")
+            else:
+                m_str = f" · median {med:.0f} km/h" if pd.notna(med) else ""
+                vlabel = f"F85 {f85:.0f} km/h (+{gap_f85:.0f}) above posted {sl:.0f} km/h{m_str}"
+        elif both_exceed:
+            verdict = "Median exceeds limit"
+            vlabel  = f"Median {med:.0f} (+{med_over:.0f}) · F85 {f85:.0f} km/h — median exceeds posted {sl:.0f} km/h"
+        elif gap_f85 < -15:
+            verdict = "Under-speed"
+            m_str = f" · median {med:.0f} km/h" if pd.notna(med) else ""
+            vlabel = f"F85 {f85:.0f} km/h ({gap_f85:.0f} below posted {sl:.0f} km/h){m_str} — possible road constraint"
         else:
-            verdict = "Appropriate"
-            vlabel  = f"Posted {sl:.0f} km/h aligns with SS standard ({ss:.0f} km/h)"
+            verdict = "Credible"
+            m_str = f" · median {med:.0f} km/h" if pd.notna(med) else ""
+            vlabel = f"F85 {f85:.0f}{m_str} within normal range of posted {sl:.0f} km/h"
+    elif pd.notna(sl) and pd.notna(ss):
+        # No GPS data — alignment-only segment
+        if sl > ss + 5:
+            verdict = "Above standard"
+            vlabel  = f"Posted {sl:.0f} km/h — no GPS data available (alignment check only)"
+        else:
+            verdict = "No GPS data"
+            vlabel  = f"No speed observations for this segment"
     else:
         verdict, vlabel = "No data", "No posted limit recorded"
 
@@ -166,8 +194,7 @@ def _build_popup_html(row: pd.Series) -> str:
                 f'{cell("Median (GPS)", med, mc)}'
                 f'{cell("F85 (GPS)", f85, fc)}'
                 f'</tr></table>'
-                f'<div class="pp-spread">Spread (F85−median): {spr_str}</div>'
-                f'<div class="pp-verdict-box">{vlabel}</div></div>')
+                f'<div class="pp-spread">Spread (F85−median): {spr_str}</div></div>')
 
     def R(icon, text):
         return (f'<div class="pp-reason"><span class="pp-reason-icon">{icon}</span>'
@@ -184,10 +211,6 @@ def _build_popup_html(row: pd.Series) -> str:
                 f'</div></div>')
 
     reasons = []
-    if pd.notna(sl) and pd.notna(ss) and sl > ss + 5:
-        reasons.append(R("↑", f"Limit {sl:.0f} exceeds {ss:.0f} km/h Safe System ceiling for {lu} {rc}"))
-    if pd.notna(sl) and pd.notna(ss) and sl < ss * 0.80:
-        reasons.append(R("⟳", f"Limit {sl:.0f} km/h is {ss-sl:.0f} km/h below design speed — likely outdated"))
     if pd.notna(f85) and pd.notna(sl) and pd.notna(med) and med > sl and f85 > sl + 15:
         reasons.append(R("🚗", f"Median {med:.0f} AND F85 {f85:.0f} km/h both exceed limit — systemic non-compliance"))
     elif pd.notna(f85) and pd.notna(sl) and f85 > sl + 15:
@@ -287,20 +310,33 @@ def _build_popup_html(row: pd.Series) -> str:
     img_html   = (f'<div class="pp-img-link"><a href="{img_url}" target="_blank">📷 View street imagery</a></div>'
                   if img_url and isinstance(img_url, str) and img_url.startswith("http") else "")
 
-    # ❶ IS THE LIMIT RIGHT — always visible block above tabs
-    if pd.notna(sl) and pd.notna(ss):
-        if sl > ss + 5:
+    # ❶ IS THE LIMIT CREDIBLE — driven by F85/median behavioral evidence
+    if pd.notna(f85) and pd.notna(sl):
+        gap_f85 = f85 - sl
+        if gap_f85 >= 20:
             q1_cls, q1_hdr_cls = "pp-q1-high", "pp-q1-hdr-high"
-            q1_verdict_label = "✗ TOO HIGH"
-        elif sl < ss * 0.80:
-            q1_cls, q1_hdr_cls = "pp-q1-lo", "pp-q1-hdr-lo"
-            q1_verdict_label = "✗ TOO LOW (outdated)"
-        elif sl < ss - 5:
+            q1_verdict_label = "✗ LIMIT NON-CREDIBLE"
+        elif gap_f85 >= 10:
             q1_cls, q1_hdr_cls = "pp-q1-hi", "pp-q1-hdr-hi"
-            q1_verdict_label = "⚠ SLIGHTLY LOW"
+            q1_verdict_label = "⚠ LOW CREDIBILITY"
+        elif pd.notna(med) and med > sl:
+            q1_cls, q1_hdr_cls = "pp-q1-hi", "pp-q1-hdr-hi"
+            q1_verdict_label = "⚠ MEDIAN EXCEEDS LIMIT"
+        elif gap_f85 < -15:
+            q1_cls, q1_hdr_cls = "pp-q1-lo", "pp-q1-hdr-lo"
+            q1_verdict_label = "⚠ UNDER-SPEED — investigate"
         else:
             q1_cls, q1_hdr_cls = "pp-q1-ok", "pp-q1-hdr-ok"
-            q1_verdict_label = "✓ APPROPRIATE"
+            q1_verdict_label = "✓ LIMIT IS CREDIBLE"
+    elif pd.notna(sl) and pd.notna(ss):
+        # No GPS data — fall back to alignment only
+        gap = sl - ss
+        if sl > ss + 5:
+            q1_cls, q1_hdr_cls = "pp-q1-high", "pp-q1-hdr-high"
+            q1_verdict_label = "✗ ABOVE STANDARD (no GPS)"
+        else:
+            q1_cls, q1_hdr_cls = "pp-q1-ok", "pp-q1-hdr-ok"
+            q1_verdict_label = "— NO GPS DATA"
     else:
         q1_cls, q1_hdr_cls, q1_verdict_label = "pp-q1-ok", "pp-q1-hdr-ok", "— NO DATA"
 
@@ -312,11 +348,9 @@ def _build_popup_html(row: pd.Series) -> str:
         if pd.notna(spread): parts.append(f"spread {spread:.0f} km/h")
         q1_speed_row = f'<div class="pp-q1-speed">📊 {" · ".join(parts)}</div>'
 
-    # "Critical + Appropriate" fix: verdict = limit direction, band = overall SSS.
-    # These measure different things. A Critical road can have an Appropriate limit
-    # if drivers ignore it (high credibility gap). Make this explicit.
-    if band in ("Critical", "High Risk") and verdict == "Appropriate":
-        verdict_display = "Limit set OK — but ignored"
+    # A Critical/High Risk road with a Credible limit means VRU exposure is driving the band.
+    if band in ("Critical", "High Risk") and verdict == "Credible":
+        verdict_display = "Limit credible — high VRU/exposure risk"
     else:
         verdict_display = verdict
 
@@ -451,15 +485,10 @@ def build_interactive_map(
 
     m = folium.Map(location=[center_lat, center_lon], zoom_start=5, tiles=None)
 
-    # Light basemap: CartoDB Positron — clean, minimal, English labels,
-    # free CDN, no API key, highly reliable. Default layer shown on load.
-    folium.TileLayer(
-        tiles="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
-        attr='© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors © <a href="https://carto.com/attributions">CARTO</a>',
-        subdomains=["a", "b", "c", "d"],
-        name="Light",
-        max_zoom=19,
-    ).add_to(m)
+    # Light basemap: CartoDB Positron built-in shortcut (same pattern as dark_matter below).
+    # Previous custom URL used {r} retina placeholder that Folium/Leaflet doesn't resolve,
+    # causing tiles to 404 and render as a blank grey canvas.
+    folium.TileLayer("CartoDB positron", name="Light").add_to(m)
 
     # Dark theme as secondary option (toggle in layer control)
     folium.TileLayer("CartoDB dark_matter", name="Dark").add_to(m)
@@ -591,7 +620,7 @@ def build_interactive_map(
             geom   = row.geometry
             sss    = row.get("sss", np.nan)
             band   = row.get("sss_band", "Acceptable")
-            color  = score_to_color(sss)
+            color  = BAND_COLORS.get(band, score_to_color(sss))  # band-exact color matches legend
             weight = 3 if band in ("Critical", "High Risk") else 2
             tooltip_txt = (
                 f"{band} | SSS {sss:.1f} | {row.get('road_class_norm','—')} "
@@ -949,7 +978,6 @@ def build_interactive_map(
                 name=f"🤖 ML Coverage Extension ({n_ml:,} estimated — no GPS data)",
                 show=False,
             )
-            from config import BAND_COLORS
             for _, row in ml_segs.iterrows():
                 coords = _geom_to_latlon_list(row.geometry)
                 if not coords:
@@ -1073,7 +1101,7 @@ def _build_legend_html() -> str:
                     else{{b.style.display='none';c.textContent='▼'}}"
            style="display:flex;align-items:center;justify-content:space-between;
                   padding:10px 14px;cursor:pointer;user-select:none">
-        <span style="font-size:13px;font-weight:700">Speed Safety Score</span>
+        <span style="font-size:13px;font-weight:700">Road Risk Level</span>
         <span id="legend-chev" style="font-size:10px;color:#9ca3af;margin-left:12px">▲</span>
       </div>
       <!-- Body - expanded by default -->
