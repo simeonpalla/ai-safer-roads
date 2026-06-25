@@ -331,9 +331,8 @@ def _build_popup_html(row: pd.Series) -> str:
     <div class="pp-bar-bg"><div class="pp-bar-fill" style="width:{sss_pct}%"></div></div>
   </div>
 </div>
-<div class="pp-body">
 {grid}
-<div style="padding:10px 14px 0">
+<div style="padding:8px 14px 0">
   <div class="pp-q1 {q1_cls}">
     <div class="pp-q1-hdr {q1_hdr_cls}">❶ IS THE LIMIT RIGHT? &nbsp; {q1_verdict_label}</div>
     <div class="pp-q1-detail">{vlabel}</div>
@@ -341,9 +340,10 @@ def _build_popup_html(row: pd.Series) -> str:
   </div>
 </div>
 <div class="pp-tabs">
-  <button class="pp-tab active" onclick="swTab('{uid}',0)">❶❷❸ Assessment</button>
+  <button class="pp-tab active" onclick="swTab('{uid}',0)">❷❸ Assessment</button>
   <button class="pp-tab" onclick="swTab('{uid}',1)">📊 Score metrics</button>
 </div>
+<div class="pp-body">
 <div id="{uid}">
   <div class="pp-panel active">
     <div class="pp-q-block pp-q-why">
@@ -385,6 +385,7 @@ def _build_popup_html(row: pd.Series) -> str:
     </table>
     <div class="pp-sources"><b>Sources:</b> ADB GPS probe · WHO Speed Manual · iRAP · Nilsson 2004 · Elvik 2009 · WHO 2023</div>
   </div>
+</div>
 </div>
 </div>
 </div>"""
@@ -505,8 +506,8 @@ def build_interactive_map(
     .pp-spread{font-size:10px;color:#6b7280;margin-top:5px}
     .pp-verdict-box{margin:6px 0 10px;font-size:11px;color:#374151;background:#f9fafb;border-radius:5px;padding:5px 8px}
     .pp-tabs{display:flex;border-bottom:1px solid #e5e7eb;background:#f3f4f6}
-    .pp-tab{flex:1;padding:8px 12px;border:none;border-bottom:3px solid transparent;cursor:pointer;font-size:12px;font-weight:600;background:#f3f4f6;color:#6b7280;border-radius:0}
-    .pp-tab.active{background:#fff;color:#1d4ed8;border-bottom:3px solid #1d4ed8;font-weight:700}
+    .pp-tab{flex:1;padding:9px 12px;border:none;border-bottom:3px solid transparent;cursor:pointer;font-size:12px;font-weight:600;background:#e5e7eb;color:#6b7280;border-radius:0;transition:all 0.15s}
+    .pp-tab.active{background:#fff;color:#1d4ed8;border-bottom:3px solid #1d4ed8;font-weight:800;box-shadow:0 -2px 0 #1d4ed8 inset}
     .pp-panel{display:none;padding:12px 14px}
     .pp-panel.active{display:block}
     .pp-section-hdr{font-size:10px;font-weight:700;color:#6b7280;letter-spacing:.06em;text-transform:uppercase;margin-bottom:6px}
@@ -1231,7 +1232,7 @@ def _build_summary_html(scored: gpd.GeoDataFrame, full_gdf: gpd.GeoDataFrame,
             )
 
     return f"""
-    <div id="summary-panel" style="position:fixed;top:52px;right:12px;z-index:9990;
+    <div id="summary-panel" style="position:fixed;top:52px;left:12px;z-index:9990;
                 background:rgba(22,22,30,0.95);color:white;
                 border-radius:10px;font-family:Arial,sans-serif;
                 font-size:12px;box-shadow:0 4px 18px rgba(0,0,0,0.5);
@@ -1260,7 +1261,7 @@ def _build_summary_html(scored: gpd.GeoDataFrame, full_gdf: gpd.GeoDataFrame,
           document.getElementById('tab-guide').style.color   = t==='guide'  ?'white':'#ccc';
         }}
       </script>
-      <div id="summary-body" style="max-height:82vh;overflow-y:auto">      <!-- Summary tab -->
+      <div id="summary-body" style="display:none;max-height:82vh;overflow-y:auto">      <!-- Summary tab -->
       <div id="panel-summary" style="padding:10px 14px">
         <div style="font-size:11px;color:#aaa;margin-bottom:6px">
           Scored segments (Tier 2 GPS confirmed): <b style="color:white">{total:,}</b>
