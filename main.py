@@ -362,28 +362,10 @@ def main():
     if corridors is not None and len(corridors):
         export_corridors(corridors, output_dir=args.out)
 
-    # Scatter plot: SSS vs pct_over_limit (proxy validation)
+    # Scatter plot — use the dedicated function from visualization.py
     try:
-        import matplotlib; matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-        mask_sc = combined["scoreable"] & combined["sss"].notna() & combined["pct_over_limit"].notna()
-        if mask_sc.any():
-            sc = combined[mask_sc]
-            fig, ax = plt.subplots(figsize=(7, 5))
-            colors = sc["sss_band"].map({"Critical":"#d62728","High Risk":"#ff7f0e","Moderate":"#bcbd22","Acceptable":"#2ca02c"})
-            ax.scatter(sc["pct_over_limit"], sc["sss"], c=colors, alpha=0.4, s=8)
-            ax.set_xlabel("% vehicles over limit (GPS proxy)")
-            ax.set_ylabel("Speed Safety Score")
-            ax.set_title("SSS vs % Over Limit — proxy validation")
-            ax.set_facecolor("#f9fafb")
-            plt.tight_layout()
-            plt.savefig(f"{args.out}/scatter_sss_vs_pct_over_limit.png", dpi=120)
-            plt.close()
-            hidden = sc[(sc["sss"] >= 40) & (sc["pct_over_limit"] < sc["pct_over_limit"].quantile(0.25))]
-            pct_missed = 100 * len(hidden) / max((sc["sss"] >= 40).sum(), 1)
-            print(f"  Scatter saved: scatter_sss_vs_pct_over_limit.png")
-            print(f"  Q1 Hidden Danger: {len(hidden):,} roads ({100*len(hidden)/len(sc):.1f}%)")
-            print(f"  Conventional monitoring misses {pct_missed:.0f}% of high-risk roads")
+        from visualization import plot_sss_vs_pct_over_limit
+        plot_sss_vs_pct_over_limit(combined, output_dir=args.out)
     except Exception as e:
         print(f"  Scatter plot skipped: {e}")
 

@@ -1,6 +1,6 @@
 # Speed Safety Score — ADB AI for Safer Roads 2026
 
-Quantifies whether posted speed limits are appropriate relative to the Safe System standard, prioritised by population exposure. Covers **Maharashtra** (India) and **Thailand** datasets provided by ADB.
+Quantifies whether posted speed limits are appropriate relative to the WHO Safe System standard, confirmed by GPS probe behaviour, and prioritised by population exposure. Covers **Maharashtra** (India) and **Thailand** from the ADB dataset.
 
 ---
 
@@ -9,12 +9,12 @@ Quantifies whether posted speed limits are appropriate relative to the Safe Syst
 ```bash
 pip install -r requirements.txt
 python download_pois.py          # one-time OSM POI fetch (~2 min)
-python main.py                   # full pipeline, ~45 min without Mapillary
+python main.py                   # full pipeline (~45 min without Mapillary)
 ```
 
-Outputs land in `outputs/run_<timestamp>/`. The key file is `speed_safety_map.html` — open it in any browser.
+Outputs land in `outputs/run_<timestamp>/`. Key files: `speed_safety_map.html` (interactive map) and `Top_Priority_Interventions.xlsx` (policy brief).
 
-> **First time?** See [Data Setup](#data-setup) below — several raster files (WorldPop, GHSL, VIIRS) must be downloaded manually before running.
+> **First time?** See [Data Setup](#data-setup) — several raster files must be downloaded manually.
 
 ---
 
@@ -22,97 +22,107 @@ Outputs land in `outputs/run_<timestamp>/`. The key file is `speed_safety_map.ht
 
 | Output | Description |
 |--------|-------------|
-| `speed_safety_map.html` | Interactive map — all scored roads, colour-coded by band, with popups |
-| `speed_safety_scores_all.gpkg` | GeoPackage with every scored segment and all columns |
-| `speed_safety_scores.csv` | Flat CSV of Tier 2 scored segments |
-| `Top_Priority_Interventions.xlsx` | Policy brief — Top 20 priority corridors with intervention narrative |
-| `ml_coverage_extension.gpkg` | XGBoost-predicted SSS for 45,183 unscored segments |
-| `score_overview.png` | Diagnostic chart: score distribution, band breakdown, sensitivity |
-| `ml_validation_scatter.png` | XGBoost OOF validation scatter (R²=0.877, RMSE=6.06) |
-| `ai_anomaly_segments.csv` | Isolation Forest flagged segments (experimental) |
+| `speed_safety_map.html` | Interactive map — 1,000 highest-risk roads with full popups (❶ Is the limit right? ❷ Why? ❸ Intervention) |
+| `speed_safety_scores_all.gpkg` | **All 14,711 scored segments** with every column — load in QGIS/ArcGIS for full network view |
+| `speed_safety_scores.csv` | Flat CSV of all Tier 2 scored segments |
+| `Top_Priority_Interventions.xlsx` | Policy brief — Critical and High Risk segments with intervention narrative |
+| `ml_coverage_extension.gpkg/csv` | XGBoost-predicted SSS for 45,183 unscored segments (R²=0.750 generalisation) |
+| `score_overview.png` | Score distribution, band breakdown, sensitivity analysis chart |
+| `scatter_sss_vs_pct_over_limit.png` | Hidden Danger quadrant: 4,028 roads (27.4%) high-risk but compliant |
+| `ai_anomaly_segments.csv` | Isolation Forest flagged segments — experimental, analyst triage only |
+
+**Note on map coverage:** The HTML map shows 500 segments per country (all Critical first, then High Risk). For full 14,711-segment coverage use `speed_safety_scores_all.gpkg` in QGIS, or the Kepler.gl link in the repo.
 
 ---
 
 ## Scoring methodology
 
-### Level 1 — Speed Safety Score (SSS)
+### Speed Safety Score (SSS = 0.20×A + 0.45×C + 0.35×V)
 
-Three sub-scores, equal-weighted:
+Three sub-scores reflecting different aspects of limit appropriateness:
 
-| Sub-score | What it measures |
-|-----------|-----------------|
-| **Safe System Alignment** (38%) | Gap between posted limit and Safe System standard for road type + land use |
-| **Limit Credibility** (30%) | Whether the posted limit matches observed 85th-percentile speed |
-| **VRU Risk Context** (32%) | Pedestrian/cyclist exposure based on land use, road class, helmet compliance |
+| Sub-score | Weight | What it measures |
+|-----------|--------|-----------------|
+| **Alignment (A)** | 20% | Gap between posted limit and WHO Safe System standard for this road type × land use. Two-sided: too high AND too low both score as misaligned |
+| **Credibility Gap (C)** | 45% | Dual-signal: F85 excess modulated by spread-based reliability weight (0.5–1.0, mixed-traffic dampener) AND median confirmation factor (0.4–1.0). Not F85 alone |
+| **VRU Context Risk (V)** | 35% | Pedestrian/PTW exposure: urban/rural multiplier + PTW country weight (Thailand 74% PTW fatalities; Maharashtra primary/trunk 37%) + VIIRS nighttime boost |
 
-Safe System limits follow WHO / iRAP protocol. **Geometry adjustment**: sinuosity ≥1.20 triggers a −10 to −25 km/h downward adjustment per AASHTO Green Book, capped at 30 km/h floor. Applied to 5,803 segments (8.3% of scored network).
+**Safe System limits** follow WHO Speed Management Manual + iRAP star ratings. 8 of 17 road class × land use cells are VERIFIED direct citations; 9 are INTERPOLATED (explicitly flagged, alignment sub-score dampened 30%). Rural primary/secondary set at 60 km/h for undivided roads (iRAP 1–2★, MH/TH context).
 
-### Level 2 — Priority Index
+**Geometry adjustment:** Sinuosity ≥1.20 triggers −10 to −25 km/h downward adjustment per AASHTO Green Book. Applied to 5,803 segments (8.3%).
 
-Exposure × Likelihood × Severity geometric mean — answers "where to act first," not "is this limit appropriate."
+**Score bands:** Critical ≥65 | High Risk 52–65 | Moderate 35–52 | Acceptable <35
 
-Components: WorldPop population density · HOTOSM schools and hospitals · OSM markets, transit, religious sites, universities, railway crossings · Nilsson Power Model fatal-crash risk · speed variability · road class severity · VIIRS nighttime exposure.
+**Weight robustness:** Mean Spearman ρ = 0.9675 under ±10% weight perturbation (>0.95 threshold).
+
+### Priority Index (secondary — "where to act first")
+
+Exposure × Likelihood × Severity geometric mean. Answers a different question from SSS: not "is this limit appropriate" but "given limited budgets, which road first." Spearman ρ = 0.51 vs SSS — correlated but adds independent information (26% top-20% overlap).
+
+Components: WorldPop population density · HOTOSM schools/hospitals · OSM markets, transit, religious, universities, crossings · Nilsson Power Model · speed variability · road class severity · VIIRS nighttime exposure.
 
 ### AI / ML layers
 
-1. **XGBoost coverage extension** — predicts SSS for 45,183 segments lacking behavioural speed data. 5-fold CV RMSE=6.06, R²=0.877. Features include GHSL settlement class, VIIRS NTL score, sinuosity, and `dist_to_nearest_vru_attractor_m`. Shown as a separate toggle layer on the map.
-2. **Isolation Forest anomaly detection** — finds statistically unusual roads relative to similar-class peers. Status: experimental; off-map, for analyst triage only.
-3. **Road geometry (sinuosity)** — computes actual/crow-flies path ratio from LineString coordinates. Adjusts Safe System limit per AASHTO Green Book. Status: production.
-4. **Mapillary street-level infrastructure** — queries Mapillary v4 API per road segment bbox. Returns traffic sign density and road object counts. High-SSS segments with zero coverage are flagged as *infrastructure blindspots*. Status: production-ready (pass `--mapillary-token`).
-   - API discovery: 0.01°×0.01° grid cells (~1 km²) complete in 3–15s. Larger 0.09° cells time out in dense Bangkok (>100k features/cell). Rural Maharashtra returned 0 features across 220 sampled cells — an infrastructure blindspot finding in itself.
-   - Bangkok coverage confirmed: 1,400–1,700 features per km² cell (Sukhumvit, Silom corridors).
-5. **VIIRS nighttime lights** — samples NASA/NOAA VIIRS annual composite radiance as a proxy for informal market activity and nighttime pedestrian exposure. Status: code complete; requires local GeoTIFF.
+| Layer | Status | Detail |
+|-------|--------|--------|
+| **XGBoost coverage extension** | Production | Predicts SSS for 45,183 unscored segments. R²=0.993 (GPS features, leakage diagnostic) / R²=0.750 (primary features only — honest generalisation estimate). Map toggle layer |
+| **Isolation Forest anomaly detection** | Experimental | Finds statistically unusual roads vs same-class peers. 2,207 flagged (15%). Not used in primary scoring or map — analyst CSV only |
+| **Road geometry (sinuosity)** | Production | Actual/crow-flies path ratio from LineString. Adjusts Safe System limit per AASHTO |
+| **VIIRS nighttime lights** | Production | NASA annual composite radiance → nighttime VRU exposure proxy |
+| **Mapillary street-level** | Optional | Queries Mapillary v4 API per segment bbox. High-SSS + zero coverage = infrastructure blindspot flag. Pass `--mapillary-token` |
 
 ---
 
-## Key findings (current run)
+## Key findings (run_20260627_140333)
 
-- **14,711 segments** fully scored (Tier 2); **14,761** alignment-only (Tier 1)
-- **679 Critical** (4.6%) · **5,121 High Risk** (34.8%) · **3,790 Moderate** (25.8%) · **5,121 Acceptable** (34.8%)
-- **7,459 segments** need speed limit reduction; average reduction required: **21.8 km/h**
-- **8,010 segments** at >2× Nilsson baseline fatal-crash risk; **4,427** at >4×
-- **5,162 Hidden Danger segments** (SSS≥45, <40% over limit) — high-risk but compliant; missed by volume-based monitoring
-- Conventional monitoring misses **75%** of high-risk roads
-- **12,625 segments** covered by Mapillary; **2,710 high-risk blindspots** (no street-level imagery)
-- **5,800 priority segments** in policy brief (679 Critical + 5,121 High Risk)
-- Est. **160.9 lives/year** saved if limits corrected (range 80–322) — illustrative, not validated
-- **309 intervention zones** covering 5,980 segments
-- XGBoost R²=**0.877**, RMSE=**6.06** — up from 0.817/8.0 baseline
-- SHAP top driver: Safe System Speed Limit (mean |SHAP|=8.38)
-- Rank stability: mean Spearman ρ=0.99 under ±10% weight perturbations
+- **14,711 segments** fully scored (Tier 2 GPS confirmed); **14,761** alignment-only (Tier 1)
+- **471 Critical** (3.2%) · **2,831 High Risk** (19.2%) · **6,248 Moderate** (42.5%) · **5,161 Acceptable** (35.1%)
+- **7,552 segments** need speed limit reduction; average reduction: **25.8 km/h**
+- **8,420 segments** at >2× Nilsson fatal-crash baseline; **5,542** at >4×
+- **4,028 Hidden Danger segments** (27.4%) — high SSS but low % over limit; missed by volume-based monitoring
+- Conventional speed-camera monitoring misses **77% of high-risk roads**
+- **1,339 segments** need enforcement (not limit change) — limit correctly set but drivers ignore it
+- Est. **178.2 lives/year** saved if all limits corrected (range 89–356) — illustrative, NOT validated
+- **165 intervention zones** covering 3,157 segments
+- XGBoost R²=**0.750** (generalisation, primary features only; R²=0.993 with GPS features = leakage diagnostic)
+- Weight stability: mean Spearman ρ=**0.9675** under ±10% perturbation (all 6 tests pass)
+- SSS uniquely flags **2,453 high-risk segments** that traffic-volume ranking would miss (83% non-overlap)
 
 ---
 
 ## Project structure
 
 ```
-main.py                  Pipeline entry point — run this
-config.py                All weights, thresholds, band cuts
-scoring.py               SSS computation (three sub-scores)
-advanced_scoring.py      Nilsson, credibility, lives-saved, intervention zones
-enrichment.py            WorldPop, HOTOSM, 7 POI types, OSM infra exposure layer
+main.py                  Pipeline entry point
+config.py                Weights (0.20/0.45/0.35), thresholds, band cuts, Safe System limits
+scoring.py               SSS computation — three sub-scores with dual-signal credibility
+advanced_scoring.py      Nilsson, credibility classes, recommended limits, lives saved, intervention zones
+preprocessing.py         Data loading, normalisation, segment ID assignment
+enrichment.py            WorldPop, HOTOSM, 7 POI types, OSM infra tags, exposure layer
+geometry_features.py     Sinuosity + bearing stddev from road geometry
 ghsl_features.py         GHSL SMOD settlement classification (7-level urbanicity)
-priority_scoring.py      Exposure × Likelihood × Severity priority index
-ml_extension.py          XGBoost coverage extension + Isolation Forest anomaly
-mapillary_features.py    Mapillary v4 API street-level infrastructure enrichment
 viirs_features.py        VIIRS nighttime lights enrichment
-download_pois.py         One-time OSM POI download (markets, transit, religious, university, crossings)
+priority_scoring.py      Exposure × Likelihood × Severity priority index
+ml_extension.py          XGBoost coverage extension + Isolation Forest anomaly detection
+mapillary_features.py    Mapillary v4 API street-level infrastructure enrichment
+evaluation.py            Sensitivity analysis, weight stability, cross-country consistency
+visualization.py         Folium interactive map + scatter chart + GeoPackage/CSV export
+policy_brief.py          Top_Priority_Interventions.xlsx generation
 logger.py                Shared logging setup
-map_builder.py           Folium interactive map
-export_policy_brief.py   Top_Priority_Interventions.xlsx
-data/                    GeoJSON inputs (MH, TH) + helmet Excel  [not in repo — ADB provided]
-enrichment_data/         Rasters and POI files  [large files not in repo — see Data Setup]
-outputs/                 One timestamped folder per pipeline run  [gitignored]
+download_pois.py         One-time OSM POI download
+extract_osm_data.py      Extract schools/hospitals/road infra from OSM PBF files
+data/                    GeoJSON inputs + helmet Excel  [gitignored — ADB provided]
+enrichment_data/         Rasters and POI files  [gitignored — see Data Setup]
+outputs/                 One timestamped folder per run  [gitignored]
 ```
 
 ---
 
 ## Data Setup
 
-All large data files are gitignored. Run these steps once before the first pipeline run.
+Large files are gitignored. Run once before first pipeline run.
 
-### 1. ADB challenge data (required)
-Place the two GeoJSONs and the helmet Excel provided by ADB into `data/`:
+### 1. ADB data (required)
 ```
 data/ADB_Innovation_Maharashtra.geojson
 data/ADB_Innovation_Thailand.geojson
@@ -120,66 +130,78 @@ data/Archive/Road_Safety_Performance_Indicators_(Helmet_Wearing_results)_(adb_da
 ```
 
 ### 2. WorldPop population rasters (required)
-Download 1 km resolution population counts for Maharashtra and Thailand from [worldpop.org](https://www.worldpop.org/geodata/listing?id=75) and place at:
+Download 1 km resolution from [worldpop.org](https://www.worldpop.org/geodata/listing?id=75):
 ```
 enrichment_data/worldpop_MH_2020_1km.tif
 enrichment_data/worldpop_TH_2020_1km.tif
 ```
 
-### 3. GHSL SMOD settlement classification (required for full R²=0.877)
-Download `GHS_SMOD_E2025_GLOBE_R2023A_54009_1000_V2_0.tif` from the
-[EU Copernicus Human Settlement Layer](https://human-settlement.emergency.copernicus.eu/) and place at:
+### 3. GHSL SMOD settlement classification (optional — improves ML)
+Download from [EU Copernicus HSL](https://human-settlement.emergency.copernicus.eu/):
 ```
 enrichment_data/ghsl/GHS_SMOD_E2025.tif
 ```
-Without this file the pipeline falls back to the binary URBAN/RURAL field (R² ~0.82).
 
-### 4. VIIRS nighttime lights (required for NTL features)
-Download the annual composite (VNL v2, 2024) from [eogdata.mines.edu/products/vnl/](https://eogdata.mines.edu/products/vnl/) and place at:
+### 4. VIIRS nighttime lights (optional)
+Download VNL v2 annual composite from [eogdata.mines.edu](https://eogdata.mines.edu/products/vnl/):
 ```
 enrichment_data/viirs/viirs_ntl.tif
 ```
 
 ### 5. OSM schools and hospitals (required)
-Download from [Humanitarian OpenStreetMap Team](https://data.humdata.org/organization/hot):
+From [Humanitarian OSM Team](https://data.humdata.org/organization/hot):
 ```
-enrichment_data/schools/schools_MH.geojson
-enrichment_data/schools/schools_TH.geojson
-enrichment_data/hospitals/hospitals_MH.geojson
-enrichment_data/hospitals/hospitals_TH.geojson
+enrichment_data/schools/schools_MH.geojson   enrichment_data/schools/schools_TH.geojson
+enrichment_data/hospitals/hospitals_MH.geojson   enrichment_data/hospitals/hospitals_TH.geojson
 ```
 
-### 6. OSM POI data — markets, transit, religious, university, crossings (auto-download)
-Run once to fetch all five POI types for both countries from the Overpass API (~2 min):
+### 6. OSM POI data — auto-download
 ```bash
-python download_pois.py
+python download_pois.py   # markets, transit, religious, university, crossings (~2 min)
 ```
-This writes to `enrichment_data/{markets,transit,religious,university,crossings}/`. Already-downloaded files are skipped on re-runs.
 
-### 7. Mapillary API token (optional — required for blindspot layer)
-Get a free token at [mapillary.com/developer](https://www.mapillary.com/developer) and pass it at runtime (see below). The pipeline runs without it; Mapillary features will be zero-filled.
+### 7. Mapillary API token (optional)
+Free token at [mapillary.com/developer](https://www.mapillary.com/developer). Pass at runtime: `--mapillary-token "MLY|..."`
 
 ---
 
 ## Reproduction
 
 ```bash
-# Install dependencies
+# Install
 pip install -r requirements.txt
 
-# Full pipeline — matches published results (R²=0.877)
-python main.py --mapillary-token "MLY|YOUR_TOKEN_HERE"
-
-# Without Mapillary (all other features intact, ~4 hr faster)
+# Full pipeline (matches published results)
 python main.py
 
-# Faster run — skip map generation and evaluation charts
+# With Mapillary blindspot detection (~5-6 hr extra)
+python main.py --mapillary-token "MLY|YOUR_TOKEN_HERE"
+
+# Skip map + eval (faster debugging)
 python main.py --no-map --no-eval
 
-# Minimum run — no VIIRS, no ML extension
-python main.py --no-viirs --no-ml
+# Skip ML extension
+python main.py --no-ml
 ```
 
-**Expected runtime** (with Mapillary, full enrichment): ~5–6 hours, dominated by Mapillary API queries for ~3,900 grid cells. Without Mapillary: ~45 minutes.
+**Runtime:** ~45 min (without Mapillary). Python 3.9+ required.
 
-Requirements: Python 3.9+, see `requirements.txt`.
+---
+
+## Viewing full results
+
+The HTML map shows the top 1,000 segments. For full 14,711-segment coverage:
+
+1. **QGIS (recommended):** Open `speed_safety_scores_all.gpkg` → style by `sss_band` column
+2. **Kepler.gl:** Drag `speed_safety_scores.csv` to [kepler.gl](https://kepler.gl) → color by `sss_band`
+3. **GitHub link for submission:** `https://github.com/simeonpalla/ai-safer-roads/tree/simsim`
+
+---
+
+## Limitations
+
+- GPS probe data is **car-biased** — truck and PTW speeds underrepresented. Spread-based reliability weight partially mitigates this
+- **79% of network unscored** — no GPS data or posted limit. Unscored ≠ safe
+- Lives saved figures are **illustrative** — VKM conversion constant unverified
+- Nilsson exponent uncertainty: 3.5–5.0 for Asian mixed traffic (Elvik 2009)
+- Safe System limits for 9 road class × land use combinations are **interpolated** estimates, not direct WHO citations
