@@ -145,6 +145,8 @@ ASPIRATIONAL_SS_THRESHOLDS = {
 # This is why Maharashtra rural roads SHOULD score higher than Thailand
 # rural roads at the same posted speed — the road quality is lower,
 # the protection is worse, and the helmet compliance is lower.
+# NOTE: Defined but currently unused — scoring.py uses the global SAFE_SYSTEM_THRESHOLDS for all countries.
+# Apply in scoring.get_safe_system_limit() with country_code=="MH" check to activate.
 SAFE_SYSTEM_THRESHOLDS_MH = {
     # Maharashtra rural: predominantly undivided, 1-2 iRAP star rating
     ("primary",   "rural"):  70,   # global standard; country-specific only with actual road data
@@ -248,8 +250,7 @@ LAND_USE_MAP = {
 #   Moderate  35–52: 4,368 segments (29.7%)
 #   Acceptable 0–35: 4,737 segments (32.2%)
 #
-# NOTE on discrete clusters: SSS has a large cluster at ~63.96 (rounds to
-# 64.0, 16.8% of segments) from roads sharing the same road-class × land-use
+# NOTE on discrete clusters: SSS distribution: mean ~39.7, std ~14.0. No artificial cluster with 0.20/0.45/0.35 weights. from roads sharing the same road-class × land-use
 # Safe System threshold. The Critical cutoff (65) sits just above this cluster,
 # so it cleanly captures only the genuinely extreme tail.
 #

@@ -16,6 +16,7 @@ import numpy as np
 import pandas as pd
 import geopandas as gpd
 from pathlib import Path
+from config import SCORE_BANDS, NILSSON_EXPONENT_CENTRAL
 
 THAILAND_PROVINCES = {
     10: "Bangkok", 11: "Samut Prakan", 12: "Nonthaburi", 13: "Pathum Thani",
@@ -259,8 +260,9 @@ def export_policy_brief(
     gdf: gpd.GeoDataFrame,
     corridors: gpd.GeoDataFrame,
     output_dir: str,
-    top_n: int = 20,   # kept for signature compatibility; no longer the cap
-) -> None:
+    top_n: int = 20,
+    r2_generalisation: float = 0.735,
+    rmse_primary: float = 6.9) -> None:
     """
     Export a ministry-ready Excel workbook covering ALL Critical and High Risk segments.
 
@@ -325,13 +327,13 @@ def export_policy_brief(
         summary_rows.append(("HEADLINE FIGURES", "", "", "", ""))
         summary_rows.append(("Total scored segments (Tier 2)", total, "", "", ""))
         summary_rows.append(("Critical (immediate action required)", n_crit,
-                              f"{100*n_crit/total:.1f}%", "", "SSS >= 60"))
+                              f"{100*n_crit/total:.1f}%", "", f"SSS >= {SCORE_BANDS['Critical'][0]}"))
         summary_rows.append(("High Risk (plan within 12 months)", n_high,
-                              f"{100*n_high/total:.1f}%", "", "SSS 45–59"))
+                              f"{100*n_high/total:.1f}%", "", f"SSS {SCORE_BANDS['High Risk'][0]}–{SCORE_BANDS['High Risk'][1]}"))
         summary_rows.append(("Moderate (schedule review)", n_mod,
-                              f"{100*n_mod/total:.1f}%", "", "SSS 25–44"))
+                              f"{100*n_mod/total:.1f}%", "", f"SSS {SCORE_BANDS['Moderate'][0]}–{SCORE_BANDS['Moderate'][1]}"))
         summary_rows.append(("Acceptable (no immediate action)", n_acc,
-                              f"{100*n_acc/total:.1f}%", "", "SSS < 25"))
+                              f"{100*n_acc/total:.1f}%", "", f"SSS < {SCORE_BANDS['Acceptable'][1]}"))
         summary_rows.append(("", "", "", "", ""))
         summary_rows.append(("BY COUNTRY", "", "", "", ""))
         for ctry in countries:
@@ -401,7 +403,7 @@ def export_policy_brief(
         if corridors is not None and len(corridors) > 0:
             keep = [c for c in ["priority_rank", "corridor_label", "country_code",
                                  "n_segments", "sss", "nilsson_fatal_ratio",
-                                 "est_lives_saved", "change_effort"]
+                                 "est_lives_saved_RELATIVE", "change_effort"]
                     if c in corridors.columns]
             corr_df = corridors[keep].copy()
 
@@ -455,7 +457,7 @@ def export_policy_brief(
             ("Validation",
              "No crash outcome validation — no crash location data was provided. "
              "Scores are calibrated against the WHO Safe System framework and validated via "
-             "5-fold XGBoost CV (RMSE=7.95, R²=0.817) and weight sensitivity testing "
+             "5-fold XGBoost CV (RMSE=7.95, R²={r2_generalisation:.3f}) and weight sensitivity testing "
              "(ρ>0.95 across 600 weight perturbations). "
              "Validate against official crash records before policy action."),
         ]

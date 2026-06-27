@@ -438,6 +438,9 @@ def _percentile_normalize(series: pd.Series, group: pd.Series = None) -> pd.Seri
     s = series.fillna(0)
     if group is None:
         if s.nunique() <= 1:
+            # All identical: use 0.5 if non-zero (natural midpoint), else 0.0
+            if s.iloc[0] != 0:
+                return pd.Series(0.5, index=series.index)
             return pd.Series(0.0, index=series.index)
         return s.rank(pct=True, method="average")
 

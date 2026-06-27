@@ -408,7 +408,7 @@ def plot_named_weight_sensitivity(gdf: gpd.GeoDataFrame, output_dir: str = ".") 
     s2 = scored["sub_score_limit_credibility"].fillna(0)
     s3 = scored["sub_score_vru_risk"].fillna(0)
 
-    baseline_sss  = 0.38*s1 + 0.30*s2 + 0.32*s3
+    baseline_sss  = WEIGHTS['speed_limit_alignment']*s1 + WEIGHTS['limit_credibility_gap']*s2 + WEIGHTS['vru_context_risk']*s3
     baseline_top500 = set(baseline_sss.nlargest(500).index)
     baseline_top100 = set(baseline_sss.nlargest(100).index)
 
@@ -493,7 +493,7 @@ def plot_proxy_validation(gdf: gpd.GeoDataFrame, output_dir: str = ".") -> str:
     s1 = gdf.get("sub_score_limit_alignment", pd.Series(0, index=gdf.index)).fillna(0)
     s2 = gdf.get("sub_score_limit_credibility", pd.Series(0, index=gdf.index)).fillna(0)
     s3 = gdf.get("sub_score_vru_risk", pd.Series(0, index=gdf.index)).fillna(0)
-    computed_sss = 0.38*s1 + 0.30*s2 + 0.32*s3
+    computed_sss = WEIGHTS['speed_limit_alignment']*s1 + WEIGHTS['limit_credibility_gap']*s2 + WEIGHTS['vru_context_risk']*s3
 
     band_col = "sss_band" if "sss_band" in gdf.columns else "priority_band"
     if band_col in gdf.columns:

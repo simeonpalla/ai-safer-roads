@@ -1,0 +1,16 @@
+country_code,road_class_norm,land_use,mean_sss,median_sss,std_sss,n_segments
+MH,motorway,urban,52.64,51.47,20.01,23
+MH,primary,rural,24.35,19.71,8.56,745
+MH,primary,urban,33.92,32.37,10.73,323
+MH,secondary,rural,24.45,22.13,9.27,1190
+MH,secondary,urban,37.17,35.0,5.97,176
+MH,trunk,rural,33.03,34.11,11.51,877
+MH,trunk,urban,39.83,29.33,17.67,239
+TH,motorway,rural,16.61,16.59,6.93,18
+TH,motorway,urban,36.45,27.66,17.68,111
+TH,primary,rural,37.38,36.77,6.9,1377
+TH,primary,urban,51.44,49.77,7.62,1779
+TH,secondary,rural,37.85,39.64,5.82,3076
+TH,secondary,urban,55.31,55.0,5.76,2764
+TH,trunk,rural,21.15,14.37,9.34,1070
+TH,trunk,urban,42.53,39.05,12.46,939

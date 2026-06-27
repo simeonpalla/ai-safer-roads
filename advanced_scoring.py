@@ -223,6 +223,12 @@ def recommend_limit(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         gdf.loc[mask, "limit_change_needed"].apply(_effort)
     )
 
+    # Non-Credible + No change needed = limit correctly set but drivers ignore it
+    if "credibility_class" in gdf.columns:
+        nc_ok = mask & (gdf["credibility_class"] == "Non-Credible") & (gdf["change_effort"] == "No change needed")
+        if nc_ok.any():
+            gdf.loc[nc_ok, "change_effort"] = "No limit change — enforce"
+
     # Under-Speed: F85 far below posted limit → poor surface, heavy trucks, bad geometry.
     # floor(F85/10)*10 gives nonsensical recommendations (e.g. 20 km/h on a rural trunk).
     # The right response is investigation, not a lower limit.

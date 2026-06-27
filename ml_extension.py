@@ -299,7 +299,7 @@ def run_ml_extension(
     # Use only primary columns for prediction — matches what the model was trained on
     X_pred = X_pred_full.reindex(columns=primary_cols_pred, fill_value=0.0)
 
-    # Confidence from fold models also rebuilt on primary features
+    # Confidence from fold models trained on primary features (same as prediction model)
     fold_models_primary = []
     kf3 = KFold(n_splits=5, shuffle=True, random_state=42)
     for tr_idx, _ in kf3.split(X_train_primary):

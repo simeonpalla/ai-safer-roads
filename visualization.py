@@ -128,7 +128,7 @@ def _build_popup_html(row: pd.Series) -> str:
     rec_limit     = row.get("recommended_limit", np.nan)
     pct_over      = row.get("pct_over_limit", np.nan)
     change_effort = row.get("change_effort", "")
-    est_lives     = row.get("est_lives_saved", np.nan)
+    est_lives     = row.get("est_lives_saved_RELATIVE", np.nan)
 
     BAND_BG = {
         "Critical":   "#b91c1c",
@@ -207,16 +207,6 @@ def _build_popup_html(row: pd.Series) -> str:
             sc = " style='color:#c2410c'" if spread > 20 else ""
             w  = " ⚠ mixed traffic" if spread > 20 else ""
             spr_str = f'<b{sc}>{spread:.0f} km/h{w}</b>'
-<<<<<<< HEAD
-        grid = (f'<div class="pp-grid"><div class="pp-grid-label">Speed at a glance</div>'
-                f'<table class="pp-cell-tbl"><tr>'
-                f'{cell("Posted limit", sl, "pp-cell-blue")}'
-                f'{cell("Safe System", ss, "pp-cell-gray")}'
-                f'{cell("Median (GPS)", med, mc)}'
-                f'{cell("F85 (GPS)", f85, fc)}'
-                f'</tr></table>'
-                f'<div class="pp-spread">Spread (F85−median): {spr_str}</div></div>')
-=======
         grid = (
             f'<div class="pp-grid"><div class="pp-grid-label">Speed at a glance</div>'
             f'<table class="pp-cell-tbl"><tr>'
@@ -228,7 +218,6 @@ def _build_popup_html(row: pd.Series) -> str:
             f'<div class="pp-spread">Spread (F85−median): {spr_str}</div>'
             f'<div class="pp-verdict-box">{vlabel}</div></div>'
         )
->>>>>>> 6990963 (Updating Visualization)
 
     def R(icon, text):
         return (
@@ -309,6 +298,10 @@ def _build_popup_html(row: pd.Series) -> str:
             "Signage not working — F85 >20 km/h above posted",
             "Speed cameras reduce F85 5–15 km/h (WHO)", "pp-badge-u", "Urgent",
         ))
+    if change_effort == "No limit change — enforce":
+        actions.append(A("📷", "Deploy enforcement cameras or physical calming",
+            f"Limit {fmt(sl,'km/h',0)} correctly set vs SS {fmt(ss,'km/h',0)} — but F85 {fmt(f85,'km/h',0)} shows drivers ignore it",
+            "Speed cameras reduce F85 5–15 km/h (WHO)", "pp-badge-u", "Urgent"))
     if credibility == "Infrastructure-Forced":
         actions.append(A(
             "🔍", "Verify speed bumps on-site",
@@ -612,25 +605,10 @@ def build_interactive_map(
 
     m = folium.Map(location=[center_lat, center_lon], zoom_start=5, tiles=None)
 
-<<<<<<< HEAD
     # Light basemap: CartoDB Positron built-in shortcut (same pattern as dark_matter below).
     # Previous custom URL used {r} retina placeholder that Folium/Leaflet doesn't resolve,
     # causing tiles to 404 and render as a blank grey canvas.
     folium.TileLayer("CartoDB positron", name="Light").add_to(m)
-=======
-    # Light basemap: CartoDB Positron — clean, minimal, English labels,
-    # free CDN, no API key, highly reliable. Default layer shown on load.
-    folium.TileLayer(
-        tiles="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
-        attr=(
-            '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> '
-            'contributors © <a href="https://carto.com/attributions">CARTO</a>'
-        ),
-        subdomains=["a", "b", "c", "d"],
-        name="Light",
-        max_zoom=19,
-    ).add_to(m)
->>>>>>> 6990963 (Updating Visualization)
 
     # Dark theme as secondary option (toggle in layer control)
     folium.TileLayer("CartoDB dark_matter", name="Dark").add_to(m)
@@ -937,6 +915,11 @@ def build_interactive_map(
     if pop_col in gdf.columns and gdf[pop_col].notna().any():
         pop_pts = gdf[gdf[pop_col].notna() & (gdf[pop_col] > 0)]
         if len(pop_pts):
+
+            if len(pop_pts) > 5000:
+
+                pop_pts = pop_pts.nlargest(5000, pop_col)
+
             heat_pop = []
             for _, row in pop_pts.iterrows():
                 try:
@@ -1496,15 +1479,17 @@ def export_for_esri(gdf: gpd.GeoDataFrame, output_dir: str = "outputs") -> None:
         "exposure_score", "dist_to_school_m", "dist_to_hospital_m",
         "school_proximity_score", "hospital_proximity_score",
         "pop_density_500m", "exposure_component_population", "exposure_component_traffic",
-        "intersection_score", "priority_score",
+        "intersection_score", "legacy_priority_score",
         "nilsson_fatal_ratio", "credibility_gap", "credibility_class", "recommended_limit",
+        "cred_raw_gap_kmh", "cred_reliability", "cred_confirmation", "cred_effective_gap_kmh",
         "likelihood_score", "severity_score", "priority_index", "priority_band",
         "sub_likelihood_speed_gap", "sub_likelihood_credibility", "sub_likelihood_variability",
         "sub_severity_safe_system", "sub_severity_nilsson", "sub_severity_infrastructure",
         "sub_severity_helmet",
         "sss_recommendation", "image_url",
+        "ml_predicted_sss", "ml_predicted_band", "ml_confidence", "is_ml_predicted",
         # AI layer kept in CSV export for downstream use; not shown on map.
-        "anomaly_score", "anomaly_flag", "anomaly_reason",
+        "experimental_anomaly_score", "experimental_anomaly_flag", "experimental_anomaly_reason",
     ]
     csv_cols = [c for c in csv_cols if c in scored.columns]
     scored[csv_cols].to_csv(f"{output_dir}/speed_safety_scores.csv", index=False)
@@ -1519,10 +1504,6 @@ def export_for_esri(gdf: gpd.GeoDataFrame, output_dir: str = "outputs") -> None:
                 "speed_limit", "ss_limit", "alignment_only_score", "alignment_only_band",
                 "image_url", "geometry",
             ] if c in tier1.columns]
-            tier1[t1_cols].to_file(
-                f"{output_dir}/speed_safety_scores_tier1_only.gpkg",
-                driver="GPKG", layer="tier1_only",
-            )
             csv_t1 = [c for c in t1_cols if c != "geometry"]
             tier1[csv_t1].to_csv(f"{output_dir}/speed_safety_scores_tier1_only.csv", index=False)
             print(

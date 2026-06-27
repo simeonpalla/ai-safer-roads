@@ -24,7 +24,9 @@ KEY DECISIONS (carried over from v4):
      30% of segments show F85 far above posted limit but pct_over < 5%,
      which is physically impossible if pct_over = % of vehicles speeding.
      It is displayed in popups as context but not scored.
-     Weight redistributed: alignment 0.30→0.38, op_speed 0.23→0.30, vru 0.27→0.32.
+     Current weights: alignment 0.20, credibility_gap 0.45, vru_context_risk 0.35.
+    Credibility carries highest weight (0.45) as it is the only behavioural confirmation component.
+    VRU context (0.35) captures structural exposure. Alignment (0.20) measures Safe System gap.
 
   2. Helmet KEPT in VRU scoring.
      Removing helmet dropped MH VRU from 70.5→58, causing MH scores to fall.
@@ -548,6 +550,21 @@ def compute_speed_safety_score(
         land_use              = gdf.loc[mask, "land_use"]               if "land_use"               in gdf.columns else None,
     )
     gdf.loc[mask, "sub_score_vru_risk"] = score_vru_context_risk(gdf[mask])
+
+    # Persist credibility decomposition for transparency
+    if "speed_85th" in gdf.columns and "speed_limit" in gdf.columns:
+        _sl  = gdf.loc[mask, "speed_limit"].fillna(0)
+        _f85 = gdf.loc[mask, "speed_85th"].fillna(0)
+        _med = gdf.loc[mask, "median_speed"].fillna(_f85) if "median_speed" in gdf.columns else _f85
+        _raw = (_f85 - _sl).clip(lower=0)
+        _spread = (_f85 - _med).abs()
+        _rel = (1.0 - ((_spread - 8) / (30 - 8)).clip(0, 1) * 0.5)
+        _med_gap = _med - _sl
+        _conf = ((_med_gap - (-10)) / (10 - (-10))).clip(0, 1) * 0.6 + 0.4
+        gdf.loc[mask, "cred_raw_gap_kmh"]      = _raw.round(1)
+        gdf.loc[mask, "cred_reliability"]       = _rel.round(3)
+        gdf.loc[mask, "cred_confirmation"]      = _conf.round(3)
+        gdf.loc[mask, "cred_effective_gap_kmh"] = (_raw * _rel * _conf).round(1)
 
     # Store compliance as display-only field (not scored)
     if "pct_over_limit" in gdf.columns:
